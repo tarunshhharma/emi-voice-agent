@@ -1,0 +1,10 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.db
+*.pdf
+
+# local only
+docs/plan.md
+.pytest_cache/

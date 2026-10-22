@@ -1,0 +1,8 @@
+fastapi==0.157.0
+uvicorn[standard]==0.54.0
+websockets==17.3
+python-dotenv==1.2.4
+sqlalchemy==2.1.5
+faker==40.43.0
+openai==3.35.1
+pytest==9.1.1

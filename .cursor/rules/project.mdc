@@ -1,0 +1,9 @@
+---
+description: EMI voice agent project context
+alwaysApply: true
+---
+- Project: Hinglish EMI reminder voice agent, synthetic data only. Full plan in docs/plan.md.
+- Stack: Python 3.11, FastAPI, asyncio, Silero VAD, Sarvam/Deepgram STT, OpenAI LLM, ElevenLabs TTS, SQLite.
+- Environment: Windows (venv or WSL2).
+- Goal: voice AI interview prep. Explain non-trivial code in short bullets and note likely interview questions.
+- Keep code simple. Do one task at a time and stop for confirmation.
