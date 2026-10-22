@@ -1,11 +1,18 @@
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 from sqlalchemy import select
 
+from app.agent.guardrails import IST
 from app.agent.tools import (
+    end_call,
+    escalate_to_human,
     get_loan_summary,
+    log_dispute,
+    mark_already_paid,
     record_promise_to_pay,
+    schedule_callback,
+    send_payment_link,
     start_call,
     verify_identity,
 )
@@ -137,3 +144,91 @@ def test_ptp_invalid_amount(session, verified_call, amount):
 
 def test_ptp_full_due_amount_is_allowed(session, verified_call):
     assert record_promise_to_pay(session, verified_call.id, "25-10-2026", 4000, today=TODAY)["ok"]
+
+
+# --- the other outcomes ---
+
+NOW = datetime(2026, 10, 22, 11, 0, tzinfo=IST)  # a Thursday morning in India
+
+
+def only_outcome(session):
+    return session.scalars(select(Outcome)).one()
+
+
+@pytest.mark.parametrize(
+    "tool, args",
+    [
+        (send_payment_link, ("sms",)),
+        (mark_already_paid, ("UTR123456",)),
+        (log_dispute, ("amount is wrong",)),
+        (schedule_callback, ("23-10-2026 10:00",)),
+    ],
+)
+def test_outcome_tools_refuse_before_verification(session, call, tool, args):
+    assert tool(session, call.id, *args)["error"] == "not_verified"
+    assert session.scalars(select(Outcome)).all() == []
+
+
+def test_send_payment_link(session, verified_call):
+    result = send_payment_link(session, verified_call.id, "whatsapp")
+    assert result["ok"] and result["link"].startswith("https://pay.example.com/")
+    assert only_outcome(session).type == "link_sent"
+    assert verified_call.outcome == "link_sent"
+
+
+def test_send_payment_link_rejects_unknown_channel(session, verified_call):
+    assert send_payment_link(session, verified_call.id, "email")["error"] == "invalid_channel"
+
+
+def test_mark_already_paid_flags_for_reconciliation(session, verified_call):
+    result = mark_already_paid(session, verified_call.id, "UTR998877")
+    assert result == {"ok": True, "flagged_for_reconciliation": True}
+    assert "UTR998877" in only_outcome(session).notes
+
+
+def test_already_paid_needs_some_detail(session, verified_call):
+    assert mark_already_paid(session, verified_call.id, "  ")["error"] == "missing_details"
+
+
+def test_log_dispute_opens_a_ticket(session, verified_call):
+    result = log_dispute(session, verified_call.id, "I never took this loan")
+    assert result["ok"] and result["ticket"].startswith("DSP-")
+    assert only_outcome(session).type == "dispute"
+
+
+def test_schedule_callback_in_hours(session, verified_call):
+    result = schedule_callback(session, verified_call.id, "23-10-2026 10:30", now=NOW)
+    assert result == {"ok": True, "callback_at": "23-10-2026 10:30"}
+    assert only_outcome(session).type == "callback"
+
+
+@pytest.mark.parametrize(
+    "when, error",
+    [
+        ("23-10-2026 21:00", "outside_calling_hours"),
+        ("23-10-2026 07:30", "outside_calling_hours"),
+        ("22-10-2026 10:00", "outside_next_7_days"),  # earlier today: already past
+        ("05-11-2026 10:00", "outside_next_7_days"),
+        ("tomorrow 10am", "invalid_datetime_format"),
+    ],
+)
+def test_schedule_callback_rejections(session, verified_call, when, error):
+    assert schedule_callback(session, verified_call.id, when, now=NOW)["error"] == error
+    assert session.scalars(select(Outcome)).all() == []
+
+
+def test_escalate_works_before_verification_and_reveals_nothing(session, call):
+    result = escalate_to_human(session, call.id, "caller lost job, very upset")
+    assert result == {"ok": True, "escalated": True}
+    assert only_outcome(session).type == "escalated"
+
+
+def test_end_call_for_wrong_number(session, call):
+    assert end_call(session, call.id, "wrong_number") == {"ok": True, "call_ended": True}
+    assert call.ended_at is not None and call.outcome == "wrong_number"
+    assert session.scalars(select(Outcome)).all() == []  # not one of the six outcomes
+
+
+def test_end_call_rejects_unknown_reason(session, call):
+    assert end_call(session, call.id, "bored")["error"] == "invalid_reason"
+    assert call.ended_at is None

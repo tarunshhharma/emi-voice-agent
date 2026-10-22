@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.agent.guardrails import IST, calling_hours_ok
 from app.agent.states import State
 from app.db.models import Call, Event, Loan, Outcome, utcnow
 
@@ -140,3 +141,104 @@ def record_promise_to_pay(
     call.outcome = "PTP"
     result = {"ok": True, "ptp_date": ptp_date.strftime(DATE_FORMAT), "ptp_amount": amount}
     return log_event(session, call_id, "record_promise_to_pay", args, result)
+
+
+# --- the other outcomes ---
+
+
+def _record_outcome(session: Session, call: Call, tool: str, args: dict, result: dict, **fields) -> dict:
+    session.add(Outcome(call_id=call.id, **fields))
+    call.outcome = fields["type"]
+    return log_event(session, call.id, tool, args, result)
+
+
+def _require_text(session: Session, call_id: int, tool: str, args: dict, value: str) -> dict | None:
+    if not value or not value.strip():
+        return log_event(session, call_id, tool, args, {"ok": False, "error": "missing_details"})
+    return None
+
+
+def send_payment_link(session: Session, call_id: int, channel: str) -> dict:
+    args = {"channel": channel}
+    call, error = _require_verified(session, call_id, "send_payment_link", args)
+    if error:
+        return error
+    if channel not in {"sms", "whatsapp"}:
+        return log_event(session, call_id, "send_payment_link", args, {"ok": False, "error": "invalid_channel"})
+    # Mock: nothing is really sent. The link points at a fake payment page.
+    result = {"ok": True, "channel": channel, "link": f"https://pay.example.com/emi/{call.loan_id}"}
+    return _record_outcome(session, call, "send_payment_link", args, result,
+                           type="link_sent", notes=f"channel: {channel}")
+
+
+def mark_already_paid(session: Session, call_id: int, utr_or_date: str) -> dict:
+    args = {"utr_or_date": utr_or_date}
+    call, error = _require_verified(session, call_id, "mark_already_paid", args)
+    if error or (error := _require_text(session, call_id, "mark_already_paid", args, utr_or_date)):
+        return error
+    # We don't argue with the caller: flag it so the reconciliation team checks the payment.
+    result = {"ok": True, "flagged_for_reconciliation": True}
+    return _record_outcome(session, call, "mark_already_paid", args, result,
+                           type="already_paid", notes=f"caller says paid: {utr_or_date.strip()}")
+
+
+def log_dispute(session: Session, call_id: int, reason: str) -> dict:
+    args = {"reason": reason}
+    call, error = _require_verified(session, call_id, "log_dispute", args)
+    if error or (error := _require_text(session, call_id, "log_dispute", args, reason)):
+        return error
+    result = {"ok": True, "ticket": f"DSP-{call.id:05d}"}
+    return _record_outcome(session, call, "log_dispute", args, result,
+                           type="dispute", notes=reason.strip())
+
+
+def schedule_callback(session: Session, call_id: int, when: str, now: datetime | None = None) -> dict:
+    """`when` is DD-MM-YYYY HH:MM in India time. Must be in the future, within 7 days, in calling hours."""
+    args = {"when": when}
+    call, error = _require_verified(session, call_id, "schedule_callback", args)
+    if error:
+        return error
+
+    def reject(reason: str) -> dict:
+        return log_event(session, call_id, "schedule_callback", args, {"ok": False, "error": reason})
+
+    try:
+        at = datetime.strptime(when.strip(), f"{DATE_FORMAT} %H:%M").replace(tzinfo=IST)
+    except ValueError:
+        return reject("invalid_datetime_format")
+    now = now or datetime.now(IST)
+    if not now < at <= now + timedelta(days=PTP_WINDOW_DAYS):
+        return reject("outside_next_7_days")
+    if not calling_hours_ok(at):
+        return reject("outside_calling_hours")
+
+    result = {"ok": True, "callback_at": at.strftime(f"{DATE_FORMAT} %H:%M")}
+    return _record_outcome(session, call, "schedule_callback", args, result,
+                           type="callback", notes=f"callback at {result['callback_at']} IST")
+
+
+def escalate_to_human(session: Session, call_id: int, reason: str) -> dict:
+    """Allowed before verification too (e.g. distress), so it must never return loan data."""
+    args = {"reason": reason}
+    call = session.get(Call, call_id)
+    if call.ended_at:
+        return log_event(session, call_id, "escalate_to_human", args, {"ok": False, "error": "call_ended"})
+    if error := _require_text(session, call_id, "escalate_to_human", args, reason):
+        return error
+    result = {"ok": True, "escalated": True}
+    return _record_outcome(session, call, "escalate_to_human", args, result,
+                           type="escalated", notes=reason.strip())
+
+
+def end_call(session: Session, call_id: int, reason: str) -> dict:
+    """For calls that end with no outcome: wrong number, borrower not available, refuses to verify."""
+    args = {"reason": reason}
+    call = session.get(Call, call_id)
+    if call.ended_at:
+        return log_event(session, call_id, "end_call", args, {"ok": False, "error": "call_ended"})
+    if reason not in {"wrong_number", "not_available", "refused_verification"}:
+        return log_event(session, call_id, "end_call", args, {"ok": False, "error": "invalid_reason"})
+    call.ended_at = utcnow()
+    call.final_state = State.ENDED
+    call.outcome = reason
+    return log_event(session, call_id, "end_call", args, {"ok": True, "call_ended": True})

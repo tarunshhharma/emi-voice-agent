@@ -9,12 +9,28 @@ class State(StrEnum):
     ENDED = "ended"  # call over
 
 
-# Which tools exist in each state. Tools the plan adds later (payment link, dispute,
-# escalate, ...) get added to these sets as they are built.
+# Tools that record the call's one outcome. Any of them succeeding moves the call to DONE.
+OUTCOME_TOOLS = {
+    "record_promise_to_pay",
+    "send_payment_link",
+    "mark_already_paid",
+    "log_dispute",
+    "schedule_callback",
+    "escalate_to_human",
+}
+
 ALLOWED_TOOLS = {
-    State.VERIFY: {"verify_identity"},
-    State.REMIND: {"get_loan_summary"},
-    State.RESOLVE: {"record_promise_to_pay"},
+    # escalate is allowed before verification (distress, anger) because it reveals nothing.
+    State.VERIFY: {"verify_identity", "escalate_to_human", "end_call"},
+    State.REMIND: {"get_loan_summary", "schedule_callback", "escalate_to_human"},
+    State.RESOLVE: {
+        "record_promise_to_pay",
+        "send_payment_link",
+        "mark_already_paid",
+        "log_dispute",
+        "schedule_callback",
+        "escalate_to_human",
+    },
     State.DONE: set(),
     State.ENDED: set(),
 }
@@ -30,7 +46,7 @@ def next_state(state: State, tool: str, result: dict) -> State:
         return State.REMIND
     if tool == "get_loan_summary":
         return State.RESOLVE
-    if tool == "record_promise_to_pay":
+    if tool in OUTCOME_TOOLS:
         return State.DONE
     return state
 

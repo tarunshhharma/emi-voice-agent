@@ -3,7 +3,7 @@ from datetime import date, timedelta
 
 from sqlalchemy import select
 
-from app.agent.states import ALLOWED_TOOLS, State, get_state, next_state
+from app.agent.states import ALLOWED_TOOLS, OUTCOME_TOOLS, State, get_state, next_state
 from app.agent.tools import start_call
 from app.db.models import Event, Outcome
 from app.pipeline.llm import run_tool, run_turn
@@ -17,9 +17,17 @@ def ptp_args(amount: int = 3500) -> str:
     return json.dumps({"date": day, "amount": amount})
 
 
-def test_each_tool_belongs_to_exactly_one_state():
-    for tool in ("verify_identity", "get_loan_summary", "record_promise_to_pay"):
-        assert sum(tool in tools for tools in ALLOWED_TOOLS.values()) == 1
+def test_nothing_that_touches_the_loan_is_allowed_before_verification():
+    assert ALLOWED_TOOLS[State.VERIFY] == {"verify_identity", "escalate_to_human", "end_call"}
+
+
+def test_every_outcome_tool_moves_the_call_to_done():
+    for tool in OUTCOME_TOOLS:
+        assert next_state(State.RESOLVE, tool, {"ok": True}) == State.DONE
+
+
+def test_no_tools_once_an_outcome_is_recorded():
+    assert ALLOWED_TOOLS[State.DONE] == set() and ALLOWED_TOOLS[State.ENDED] == set()
 
 
 def test_call_starts_in_verify(session):
@@ -86,8 +94,9 @@ def test_model_only_sees_tools_for_the_current_state(session):
     ])
     run_turn(client, session, call.id, [], on_text=lambda d: None)
 
-    tool_names = [[t["name"] for t in r["tools"]] for r in client.requests]
-    assert tool_names == [["verify_identity"], ["get_loan_summary"], ["record_promise_to_pay"]]
+    offered = [{t["name"] for t in r["tools"]} for r in client.requests]
+    expected = [ALLOWED_TOOLS[State.VERIFY], ALLOWED_TOOLS[State.REMIND], ALLOWED_TOOLS[State.RESOLVE]]
+    assert offered == expected
     assert "not verified yet" in client.requests[0]["instructions"]
     assert "Call get_loan_summary now" in client.requests[1]["instructions"]
 

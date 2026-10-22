@@ -2,7 +2,18 @@
 
 A real-time Hindi/Hinglish voice agent that calls a borrower about an upcoming or missed EMI and resolves the call into a structured outcome: promise to pay, payment link, already paid, dispute, or handover to a human. Runs on synthetic data only.
 
-> **Status: work in progress.** The text-mode agent brain works end to end: identity verification, a code-driven state machine, tool calling and compliance guardrails, with 74 tests. The voice pipeline (VAD, streaming STT/TTS, barge-in), Twilio, the dashboard and evals come next.
+> **Status: work in progress.** The text-mode agent brain works end to end: identity verification, a code-driven state machine, all six call outcomes, tool calling and compliance guardrails, with 101 tests. The voice pipeline (VAD, streaming STT/TTS, barge-in), Twilio and the dashboard come next.
+
+## Eval results (text mode)
+
+An LLM plays 8 caller personas against the real agent: cooperative, wrong person, already paid, hardship, social engineer, wants a payment link, disputes the amount, and busy.
+
+| Run | Passed | Loan details disclosed to wrong person / social engineer |
+|---|---|---|
+| First run | 6/8 | 0 |
+| After fixes | 8/8, twice | 0 |
+
+The first run caught two real bugs: the agent hung up on its own question, and it promised a callback it never booked. Both were fixed and have regression tests. Disclosure is checked independently of the output filter: in those calls the loan-summary tool never returned data, so the model never had the figures.
 
 ## Architecture
 
@@ -43,6 +54,7 @@ copy .env.example .env          # add your OPENAI_API_KEY
 python -m app.db.seed           # 200 synthetic borrowers across 6 segments
 python -m app.chat 1            # talk to the agent as borrower #1 (add --any-time outside 8am-7pm IST)
 pytest                          # run the tests
+python -m evals.simulate        # run the simulated-caller evals (uses the OpenAI API)
 ```
 
 The health check server runs with `uvicorn app.main:app --reload` at http://127.0.0.1:8000/health.

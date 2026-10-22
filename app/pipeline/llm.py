@@ -18,67 +18,98 @@ log = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 5  # stops a model that keeps calling tools forever
 SENTENCE_END = re.compile(r"[.!?।]\s")  # needs the space after, so "3.5" is not split
 
+def _schema(tool_name: str, description: str, /, **properties) -> dict:
+    """Strict function schema: every property is required and nothing extra is allowed.
+    The `/` makes the first two positional-only, so a property can itself be called "name"."""
+    return {
+        "type": "function",
+        "name": tool_name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties),
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+
+
+def _text(description: str) -> dict:
+    return {"type": "string", "description": description}
+
+
 TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "name": "verify_identity",
-        "description": "Check the caller's identity against our records. Call this before any loan detail is shared.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Caller's full name"},
-                "dob_or_last4": {
-                    "type": "string",
-                    "description": "Date of birth as DD-MM-YYYY, or the last 4 digits of their phone number",
-                },
-            },
-            "required": ["name", "dob_or_last4"],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "name": "get_loan_summary",
-        "description": "Get the EMI amount, due date, days overdue and late fee. Only works after verification.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
-    {
-        "type": "function",
-        "name": "record_promise_to_pay",
-        "description": "Record the caller's promise to pay. Date must be within the next 7 days; amount cannot exceed the total due.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {"type": "string", "description": "Payment date as DD-MM-YYYY"},
-                "amount": {"type": "integer", "description": "Amount in rupees"},
-            },
-            "required": ["date", "amount"],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
+    _schema(
+        "verify_identity",
+        "Check the caller's identity against our records. Call this before any loan detail is shared.",
+        name=_text("Caller's full name, exactly as the caller said it"),
+        dob_or_last4=_text("Date of birth as DD-MM-YYYY, or the last 4 digits of their phone number"),
+    ),
+    _schema(
+        "get_loan_summary",
+        "Get the EMI amount, due date, days overdue and late fee. Only works after verification.",
+    ),
+    _schema(
+        "record_promise_to_pay",
+        "Record the caller's promise to pay. Date must be within the next 7 days; amount cannot exceed the total due.",
+        date=_text("Payment date as DD-MM-YYYY"),
+        amount={"type": "integer", "description": "Amount in rupees"},
+    ),
+    _schema(
+        "send_payment_link",
+        "Send the caller a payment link so they can pay now.",
+        channel={"type": "string", "enum": ["sms", "whatsapp"]},
+    ),
+    _schema(
+        "mark_already_paid",
+        "The caller says they already paid. Flag it for reconciliation; do not argue.",
+        utr_or_date=_text("Payment reference (UTR) or the date they paid, as the caller said it"),
+    ),
+    _schema(
+        "log_dispute",
+        "The caller disputes the amount or the loan itself. Opens a ticket; stop asking for payment.",
+        reason=_text("Short summary of the dispute in the caller's words"),
+    ),
+    _schema(
+        "schedule_callback",
+        "Book a callback when the caller can't talk now. Must be within 7 days, between 8 am and 7 pm.",
+        when=_text("Callback time as DD-MM-YYYY HH:MM (24-hour, India time)"),
+    ),
+    _schema(
+        "escalate_to_human",
+        "Hand the call to a human agent: hardship (job loss, illness), anger, legal threats, "
+        "asks not to be called, or repeated confusion.",
+        reason=_text("Why a human is needed"),
+    ),
+    _schema(
+        "end_call",
+        "End the call when it can't continue: wrong number, borrower not available, or caller refuses to verify.",
+        reason={"type": "string", "enum": ["wrong_number", "not_available", "refused_verification"]},
+    ),
 ]
+
+# How each tool's JSON arguments map onto the Python function in tools.py.
+TOOL_FUNCTIONS = {
+    "verify_identity": lambda s, c, a: tools.verify_identity(s, c, a["name"], a["dob_or_last4"]),
+    "get_loan_summary": lambda s, c, a: tools.get_loan_summary(s, c),
+    "record_promise_to_pay": lambda s, c, a: tools.record_promise_to_pay(s, c, a["date"], a["amount"]),
+    "send_payment_link": lambda s, c, a: tools.send_payment_link(s, c, a["channel"]),
+    "mark_already_paid": lambda s, c, a: tools.mark_already_paid(s, c, a["utr_or_date"]),
+    "log_dispute": lambda s, c, a: tools.log_dispute(s, c, a["reason"]),
+    "schedule_callback": lambda s, c, a: tools.schedule_callback(s, c, a["when"]),
+    "escalate_to_human": lambda s, c, a: tools.escalate_to_human(s, c, a["reason"]),
+    "end_call": lambda s, c, a: tools.end_call(s, c, a["reason"]),
+}
 
 
 def _dispatch(session: Session, call_id: int, name: str, arguments: str) -> dict:
+    if name not in TOOL_FUNCTIONS:
+        return {"ok": False, "error": "unknown_tool"}
     try:
-        args = json.loads(arguments)
-        if name == "verify_identity":
-            return tools.verify_identity(session, call_id, args["name"], args["dob_or_last4"])
-        if name == "get_loan_summary":
-            return tools.get_loan_summary(session, call_id)
-        if name == "record_promise_to_pay":
-            return tools.record_promise_to_pay(session, call_id, args["date"], args["amount"])
-    except (json.JSONDecodeError, KeyError, TypeError):
+        return TOOL_FUNCTIONS[name](session, call_id, json.loads(arguments))
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
         return {"ok": False, "error": "bad_arguments"}
-    return {"ok": False, "error": "unknown_tool"}
 
 
 def run_tool(session: Session, call_id: int, name: str, arguments: str) -> dict:
@@ -143,6 +174,11 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
                 while match := SENTENCE_END.search(buffer):  # speak each finished sentence
                     say(buffer[: match.end()])
                     buffer = buffer[match.end():]
+            elif event.type == "response.output_text.done":
+                # One response can hold several message items (e.g. a "commentary" and a
+                # "final_answer", sometimes identical). Each item ends a sentence.
+                say(buffer)
+                buffer = ""
             elif event.type == "response.completed":
                 output = event.response.output
         say(buffer)  # whatever is left when the reply ends
@@ -152,7 +188,14 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         if not tool_calls:
             break
         for tool_call in tool_calls:
-            result = run_tool(session, call_id, tool_call.name, tool_call.arguments)
+            if tool_call.name == "end_call" and any(s.endswith("?") for s in spoken):
+                # Found by evals: the model asked for the DOB and hung up in the same turn.
+                # Hanging up on a question we just asked is never right, so wait for the answer.
+                result = tools.log_event(
+                    session, call_id, "end_call", {}, {"ok": False, "error": "wait_for_caller_answer"}
+                )
+            else:
+                result = run_tool(session, call_id, tool_call.name, tool_call.arguments)
             messages.append(
                 {"type": "function_call_output", "call_id": tool_call.call_id, "output": json.dumps(result)}
             )
