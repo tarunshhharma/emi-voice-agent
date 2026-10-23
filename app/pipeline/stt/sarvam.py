@@ -51,9 +51,9 @@ def parse_message(raw: str) -> Transcript | None:
 
 
 class SarvamSTT(StreamingSTT):
-    def __init__(self, api_key: str | None = None, language_code: str = "hi-IN"):
+    def __init__(self, api_key: str | None = None, language_code: str = "hi-IN", mode: str | None = None):
         self.api_key = api_key or os.environ["SARVAM_API_KEY"]
-        self.url = build_url(language_code)
+        self.url = build_url(language_code, mode)
         self._ws = None
         self._buffer = b""
         self._keepalive = None

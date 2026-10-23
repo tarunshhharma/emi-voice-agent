@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 
 from app.pipeline import audio, vad
 from app.pipeline.session import VoiceSession
-from app.pipeline.stt.sarvam import SarvamSTT
+from app.pipeline.stt import make_stt
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -51,8 +51,8 @@ async def browser_audio(ws: WebSocket):
     """Browser mic -> VAD -> streaming STT -> transcripts back to the browser.
     The audio is also saved, to build the clip set for the WER test."""
     await ws.accept()
-    stt = SarvamSTT()
     try:
+        stt = make_stt()  # Sarvam by default; STT_PROVIDER=deepgram in .env to switch
         await stt.connect()
     except Exception as e:  # bad key, network down: tell the user instead of failing silently
         log.warning("STT connect failed: %s", e)

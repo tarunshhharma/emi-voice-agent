@@ -30,6 +30,49 @@ def dbfs(data: bytes) -> float:
     return 20 * math.log10(rms / 32768) if rms > 0 else SILENCE_DB
 
 
+def resample(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
+    """Linear-interpolation resampling of 16-bit PCM (simple; no anti-aliasing filter)."""
+    import numpy as np
+
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    n_out = int(len(x) * to_rate / from_rate)
+    positions = np.arange(n_out) * (from_rate / to_rate)
+    return np.interp(positions, np.arange(len(x)), x).astype(np.int16).tobytes()
+
+
+# G.711 mu-law: the 8-bit telephone codec Twilio uses. Quiet sounds keep more detail
+# than loud ones, which suits speech: 8 bits per sample instead of 16.
+MULAW_BIAS = 0x84
+MULAW_CLIP = 32635
+
+
+def mulaw_encode(pcm: bytes) -> bytes:
+    import numpy as np
+
+    s = np.frombuffer(pcm, dtype=np.int16).astype(np.int32)
+    sign = np.where(s < 0, 0x80, 0)
+    magnitude = np.minimum(np.abs(s), MULAW_CLIP) + MULAW_BIAS
+    exponent = np.floor(np.log2(magnitude)).astype(np.int32) - 7
+    mantissa = (magnitude >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa) & 0xFF).astype(np.uint8).tobytes()
+
+
+def mulaw_decode(data: bytes) -> bytes:
+    import numpy as np
+
+    b = ~np.frombuffer(data, dtype=np.uint8).astype(np.int32) & 0xFF
+    exponent = (b >> 4) & 0x07
+    magnitude = (((b & 0x0F) << 3) + MULAW_BIAS) << exponent
+    s = np.where(b & 0x80, MULAW_BIAS - magnitude, magnitude - MULAW_BIAS)
+    return s.astype(np.int16).tobytes()
+
+
+def phone_quality(pcm: bytes) -> bytes:
+    """What a phone line does to 16 kHz audio: down to 8 kHz, through mu-law, back up to 16 kHz."""
+    narrow = resample(pcm, SAMPLE_RATE, 8000)
+    return resample(mulaw_decode(mulaw_encode(narrow)), 8000, SAMPLE_RATE)
+
+
 def save_wav(path: Path, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as f:
