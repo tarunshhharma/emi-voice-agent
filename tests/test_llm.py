@@ -115,3 +115,44 @@ def test_verify_in_the_same_turn_as_our_question_is_deferred_and_not_a_failed_at
     deferred = session.query(Event).filter_by(call_id=call.id, tool_name="deferred_tool").one()
     assert json.loads(deferred.args_json) == {"tool": "verify_identity"}
     assert call.verified is False
+    assert client.calls == 1  # the turn ends after deferring: no extra request, no repeated question
+
+
+def _tool_call_with_announcement(name, arguments, said_first=None):
+    """A response that (optionally) says a sentence, then starts a tool call, like the live stream."""
+    from types import SimpleNamespace as NS
+    item = NS(type="function_call", name=name, arguments=json.dumps(arguments), call_id="call_1")
+    events = []
+    if said_first:
+        events += [NS(type="response.output_item.added", output_index=0, item=NS(type="message", phase="commentary")),
+                   NS(type="response.output_text.delta", output_index=0, delta=said_first),
+                   NS(type="response.output_text.done", output_index=0)]
+    index = 1 if said_first else 0
+    events.append(NS(type="response.output_item.added", output_index=index, item=item))
+    output = ([NS(type="message")] if said_first else []) + [item]
+    events.append(NS(type="response.completed", response=NS(output=output)))
+    return events
+
+
+def test_tool_start_is_announced_once_before_anything_is_said(session):
+    client = FakeClient([
+        _tool_call_with_announcement("verify_identity", {"name": "Rahul Sharma", "dob_or_last4": "14-05-1990"}),
+        _tool_call_with_announcement("get_loan_summary", {}),
+        text_response("Dhanyavaad Rahul ji. "),
+    ])
+    call = start_call(session, 1)
+    announced = []
+    run_turn(client, session, call.id, [], on_text=lambda d: None, on_tool_start=announced.append)
+    assert announced == ["verify_identity"]  # the second tool in the same turn is not announced again
+
+
+def test_no_tool_announcement_after_the_agent_already_spoke(session):
+    client = FakeClient([
+        _tool_call_with_announcement("verify_identity", {"name": "Rahul Sharma", "dob_or_last4": "14-05-1990"},
+                                     said_first="Ek minute, main verify karti hoon. "),
+        text_response("Dhanyavaad. "),
+    ])
+    call = start_call(session, 1)
+    announced = []
+    run_turn(client, session, call.id, [], on_text=lambda d: None, on_tool_start=announced.append)
+    assert announced == []  # she already said something; a filler on top would double up

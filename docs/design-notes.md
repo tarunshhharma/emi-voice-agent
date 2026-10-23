@@ -21,3 +21,18 @@
 **What's next**
 - Day 5: cut LLM latency (model choice, prompt size, connection reuse, filler during tools), tune VAD silence with the recorded turn-taking clips, dashboard, deploy, demo video.
 - Day 6: verify-factor check, Twilio, eval run with the judge, red-team.
+
+## Day 5 (part 1) · Fri 23 Oct 2026 — Latency and turn-taking
+
+**What got done**
+- Profiled the LLM: six models answer a plain turn in ~1 s; tool turns take 3.7–5.3 s because of sequential round trips. Added a pre-synthesized filler at the first tool call (first sound on the verify turn ~4.9 s → ~2.5 s), one shared warm OpenAI client (~400 ms saved on the first request), and `filler_ms` alongside `voice_to_voice_ms`.
+- Tuned endpointing on recorded clips: pauses inside a sentence are 320–1480 ms, so the silence stays 500 ms and continuations are merged (pending reply rolled back, both fragments answered together).
+- Backchannels: pause at 300 ms of caller speech, decide on the final transcript (resume vs barge-in).
+
+**What broke, and why**
+- After a deferred tool, another LLM round made the model apologise and repeat itself; the turn now ends after a deferral.
+- A reply generated while Priya was paused was counted as heard; "heard" now means audio played before the pause.
+- Sarvam misheard digits and dates in synthesized speech ("21" → "24", "May" → "mein"), which fails verification. Day 6: read the DOB back before verifying.
+
+**What's next**
+- Dashboard (required), then deploy. Day 6: verify-factor check, eval run with judge, red-team.

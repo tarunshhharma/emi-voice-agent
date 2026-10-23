@@ -13,7 +13,7 @@ def test_durations_split_voice_to_voice_into_stages():
                   agent_start=10.8, first_sentence=12.3, first_audio=12.7)
     d = t.durations()
     assert d == {"endpoint_ms": 500, "stt_ms": 300, "llm_ttft_ms": 1500, "tts_first_byte_ms": 400,
-                 "voice_to_voice_ms": 2700, "barge_in_ms": None}
+                 "voice_to_voice_ms": 2700, "filler_ms": None, "barge_in_ms": None}
     stages = d["endpoint_ms"] + d["stt_ms"] + d["llm_ttft_ms"] + d["tts_first_byte_ms"]
     assert stages == d["voice_to_voice_ms"]  # no hidden time when nothing waits in the queue
 
@@ -69,6 +69,7 @@ def test_an_interrupted_reply_is_saved_with_its_barge_in_time():
         await asyncio.sleep(0.05)  # past the Windows clock tick (see the barge-in test)
         for _ in range(2 * BARGE_IN_FRAMES):
             await session.on_frame(FRAME)
+        await session.on_final("ruko", TurnTimer())
         agent.release.set()
         await asyncio.sleep(0.3)
         conversation.cancel()

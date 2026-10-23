@@ -20,7 +20,8 @@ class TurnTimer:
     stt_final: float | None = None  # final transcript arrived
     agent_start: float | None = None  # agent turn began (can wait for a previous one)
     first_sentence: float | None = None  # first checked sentence ready to speak
-    first_audio: float | None = None  # first audio byte sent to the browser
+    first_audio: float | None = None  # first audio byte of the real reply sent to the browser
+    filler_audio: float | None = None  # filler line sent while a tool runs (what the caller hears first)
     barge_in_ms: int | None = None  # caller started talking over this reply -> stop sent
 
     def durations(self) -> dict:
@@ -33,11 +34,12 @@ class TurnTimer:
             "llm_ttft_ms": gap(self.agent_start, self.first_sentence),
             "tts_first_byte_ms": gap(self.first_sentence, self.first_audio),
             "voice_to_voice_ms": gap(self.caller_stopped, self.first_audio),
+            "filler_ms": gap(self.caller_stopped, self.filler_audio),
             "barge_in_ms": self.barge_in_ms,
         }
 
 
-STAGES = ["endpoint_ms", "stt_ms", "llm_ttft_ms", "tts_first_byte_ms", "voice_to_voice_ms", "barge_in_ms"]
+STAGES = ["endpoint_ms", "stt_ms", "llm_ttft_ms", "tts_first_byte_ms", "voice_to_voice_ms", "filler_ms", "barge_in_ms"]
 
 
 def percentile(values: list[int], p: int) -> int:

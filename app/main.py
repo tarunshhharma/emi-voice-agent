@@ -29,6 +29,9 @@ async def lifespan(app: FastAPI):
     # Load (and on first run download) the VAD model before any call arrives,
     # in a thread so startup doesn't block the event loop.
     await asyncio.to_thread(vad.load_model)
+    # One OpenAI client for every call: it keeps its connections open, and a new one costs
+    # ~400 ms of TLS and setup on the first request (measured).
+    app.state.openai = OpenAI()
     yield
 
 
@@ -60,7 +63,7 @@ async def browser_audio(ws: WebSocket):
     try:
         # Opening the call reads and writes the DB, so it runs in a thread like every agent turn.
         agent = await asyncio.to_thread(
-            CallAgent, db, OpenAI(), int(ws.query_params.get("loan", 1)),
+            CallAgent, db, ws.app.state.openai, int(ws.query_params.get("loan", 1)),
             allow_off_hours=os.getenv("ALLOW_OFF_HOURS") == "1",
         )
     except (CallBlocked, ValueError) as e:  # guardrail refused, or a bad loan id
@@ -69,6 +72,10 @@ async def browser_audio(ws: WebSocket):
         await ws.close()
         db.close()
         return
+    # Open (or refresh) the connection to OpenAI while the opening line plays, so the
+    # caller's first turn doesn't pay for it. A cheap request; its result is unused.
+    warm = asyncio.create_task(asyncio.to_thread(ws.app.state.openai.models.list), name="warm-openai")
+    warm.add_done_callback(_log_task_failure)
     b = agent.borrower
     # Synthetic data, shown only in the browser so you know what to say (never logged).
     await ws.send_json({"type": "dev", "text": f"{b.name}, DOB {b.dob:%d-%m-%Y}, phone ends {b.phone[-4:]}"})

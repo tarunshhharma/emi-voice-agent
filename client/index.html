@@ -83,21 +83,23 @@ registerProcessor("pcm16-frames", Pcm16Frames);
 `;
 
 const $ = (id) => document.getElementById(id);
-let ws, stream, ctx, sent = 0;
-let playAt = 0;  // when the next audio chunk should start, in AudioContext time
+let ws, stream, ctx, out, sent = 0;
+// Priya's audio plays in its own AudioContext (out), separate from the mic's (ctx), so it can
+// be paused with out.suspend() while the caller speaks without stopping the microphone.
+let playAt = 0;  // when the next audio chunk should start, in out's time
 let queued = [];  // chunks scheduled but not finished, so barge-in can stop them all
 
 // Agent speech arrives as 16 kHz 16-bit PCM chunks. Schedule each one right after the
 // previous, so chunks play back to back without gaps however the network delivers them.
 function play(buffer) {
   const pcm = new Int16Array(buffer, 0, buffer.byteLength >> 1);
-  const audio = ctx.createBuffer(1, pcm.length, 16000);  // the browser resamples to its own rate
+  const audio = out.createBuffer(1, pcm.length, 16000);  // the browser resamples to its own rate
   const out = audio.getChannelData(0);
   for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 32768;
-  const src = ctx.createBufferSource();
+  const src = out.createBufferSource();
   src.buffer = audio;
-  src.connect(ctx.destination);
-  playAt = Math.max(playAt, ctx.currentTime);
+  src.connect(out.destination);
+  playAt = Math.max(playAt, out.currentTime);
   src.start(playAt);
   playAt += audio.duration;
   queued.push(src);
@@ -109,6 +111,7 @@ function flush() {
   for (const src of queued) src.stop();
   queued = [];
   playAt = 0;
+  out.resume();  // it may have been paused while the caller spoke
 }
 
 let agentLine = null;  // the "Priya:" line that sentences of the current reply are added to
@@ -136,6 +139,7 @@ async function start() {
   // Created first, inside the click, so audio may play (autoplay rules) even if the agent
   // starts speaking while the mic permission prompt is still open.
   ctx = new AudioContext();
+  out = new AudioContext();
   playAt = 0;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const loan = new URLSearchParams(location.search).get("loan") || "1";  // ?loan=5 calls another borrower
@@ -156,13 +160,18 @@ async function start() {
       // Where the wait went: you stopped -> VAD sure -> STT final -> first sentence -> first audio.
       const t = document.createElement("small");
       t.textContent = ` voice-to-voice ${m.voice_to_voice_ms} ms = endpoint ${m.endpoint_ms} + STT ${m.stt_ms}`
-        + ` + LLM ${m.llm_ttft_ms} + TTS ${m.tts_first_byte_ms} (+ queue)`;
+        + ` + LLM ${m.llm_ttft_ms} + TTS ${m.tts_first_byte_ms} (+ queue)`
+        + (m.filler_ms != null ? ` · first sound ${m.filler_ms} ms (filler)` : "");
       t.style.display = "block";
       agentLine?.append(t);
+    } else if (m.type === "pause") {
+      out.suspend();  // the caller started talking: hold Priya until we know if it's just "haan"
+    } else if (m.type === "resume") {
+      out.resume();   // it was a backchannel (or noise): carry on from where she paused
     } else if (m.type === "barge_in") {
       flush();
       const t = document.createElement("small");
-      t.textContent = "(interrupted)";
+      t.textContent = m.continuation ? "(you continued: answering both parts together)" : "(interrupted)";
       agentLine?.append(t);
     } else if (m.type === "dev") {
       $("dev").textContent = m.text;
@@ -219,12 +228,13 @@ async function start() {
 async function stop() {
   stream?.getTracks().forEach((t) => t.stop());
   await ctx?.close();
+  await out?.close();
   ws?.close();
   $("level").style.width = "0";
   $("status").textContent = "Stopped: recording saved on the server";
   $("toggle").textContent = "Start call";
   $("toggle").classList.remove("stop");
-  stream = ctx = null;
+  stream = ctx = out = null;
 }
 
 $("toggle").addEventListener("click", () => {

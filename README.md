@@ -2,7 +2,7 @@
 
 A real-time Hindi/Hinglish voice agent that calls a borrower about an upcoming or missed EMI and resolves the call into a structured outcome: promise to pay, payment link, already paid, dispute, or handover to a human. Runs on synthetic data only.
 
-> **Status: work in progress.** A full spoken call works in the browser: Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in, and per-stage latency logged for every turn. 168 tests. Next: latency tuning (the LLM dominates), a dashboard, a public demo, then Twilio and a larger eval run.
+> **Status: work in progress.** A full spoken call works in the browser: Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in with backchannel handling, and per-stage latency logged for every turn. 183 tests. Next: a dashboard, a public demo, then a larger eval run, red-team and Twilio.
 
 ## Eval results (text mode)
 
@@ -70,7 +70,19 @@ Every voice turn is timed stage by stage on one monotonic clock and saved in `tu
 | **Voice-to-voice** | **3–6.8 s** | Caller stops talking to first agent audio. Target: p50 under 1.5 s |
 | Barge-in | ~300 ms | Caller starts talking over the agent to the stop command |
 
-The LLM is the bottleneck, not STT or TTS, so that is where the tuning goes next.
+The LLM is the bottleneck, not STT or TTS. Profiling showed why: six models (gpt-6-luna, gpt-5.4-mini/nano, gpt-4.1-mini/nano, gpt-4o-mini) all answer a plain turn in about 1 s, but a verify turn needs three sequential requests (verify, fetch the loan, speak), 3.7–5.3 s. So the agent now plays a pre-synthesized filler ("Ek second, main check kar rahi hoon") the moment the model starts a tool call: first sound on the verify turn went from ~4.9 s to ~2.5 s. Both numbers are logged (`filler_ms`, `voice_to_voice_ms`). One shared OpenAI client saves ~400 ms of connection setup on the first request.
+
+## Turn-taking
+
+When has the caller finished, and is "haan" an interruption? Measured on 12 recorded clips (`python -m evals.vad_tune`):
+
+| End-of-turn silence | 300 ms | **500 ms (used)** | 700 ms | 900 ms |
+|---|---|---|---|---|
+| Clips with the right number of turns | 7/12 | 8/12 | 8/12 | 10/12 |
+
+Pauses inside a sentence ranged from 320 to 1480 ms, so no fixed threshold works without adding latency to every reply; fan and TV noise never caused a false turn. Instead:
+- **Continuations:** if the caller carries on before the agent's reply has played, that reply is rolled back and both fragments are answered as one turn. The LLM's thinking time is the grace window.
+- **Backchannels:** 300 ms of caller speech pauses the agent; the final transcript decides. "haan / hmm / ji / theek hai" resumes her where she paused; anything else is a barge-in. Sarvam's partials arrive ~1 s after speech starts, too late to decide sooner.
 
 ## Design decisions
 

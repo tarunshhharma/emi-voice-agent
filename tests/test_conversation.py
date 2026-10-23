@@ -6,7 +6,7 @@ import pytest
 
 from app.pipeline.call import CallAgent, CallBlocked
 from app.pipeline.metrics import TurnTimer
-from app.pipeline.session import VoiceSession, from_list
+from app.pipeline.session import FILLER_LINE, VoiceSession, from_list
 from tests.fakes import FakeClient, text_response, tool_response
 
 
@@ -36,7 +36,7 @@ class FakeAgent:
     def save_turn(self, caller_text, agent_text, timings, interrupted):
         self.saved.append((caller_text, agent_text, timings, interrupted))
 
-    def turn(self, text, on_text, interrupted=False):
+    def turn(self, text, on_text, interrupted=False, on_tool_start=None, replaces_previous=False):
         self.threads.add(threading.current_thread().name)
         self.interrupted_flags.append(interrupted)
         if text == self.fail_on:
@@ -78,7 +78,8 @@ def test_converse_speaks_opening_then_each_turn_until_the_call_ends():
         await asyncio.wait_for(session.converse(), 5)
 
     asyncio.run(run())
-    assert [s.strip() for s in tts.heard] == [agent.first_line, "Dhanyavaad.", "Shukriya, namaste."]
+    spoken = [s.strip() for s in tts.heard if s != FILLER_LINE]  # the filler is pre-synthesized too
+    assert spoken == [agent.first_line, "Dhanyavaad.", "Shukriya, namaste."]
     assert sent[-1] == {"type": "ended"}
 
 
@@ -151,7 +152,7 @@ class SlowAgent(FakeAgent):
         self.release = threading.Event()
         self.started = threading.Event()
 
-    def turn(self, text, on_text, interrupted=False):
+    def turn(self, text, on_text, interrupted=False, on_tool_start=None, replaces_previous=False):
         self.interrupted_flags.append(interrupted)
         if text == "ruko":
             return False
@@ -190,15 +191,18 @@ def test_caller_talking_over_a_reply_cancels_it_and_the_next_turn_knows():
         await asyncio.sleep(0.05)
         for _ in range(2 * BARGE_IN_FRAMES):  # the caller speaks over Priya
             await session.on_frame(FRAME)
+        first_reply = session.reply_task
+        assert sent[-1]["type"] in ("pause", "vad") and not first_reply.cancelled()  # paused, not yet decided
+        await session.on_final("ruko", TurnTimer())  # not a backchannel: a real interruption
         await asyncio.sleep(0.05)
-        assert session.reply_task.cancelled()
+        assert first_reply.cancelled()
         agent.release.set()  # the LLM thread finishes on its own, unheard
-        session.user_turns.put_nowait(("ruko", TurnTimer()))  # what the caller said becomes the next turn
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.2)  # "ruko" was queued by on_final and becomes the next turn
         conversation.cancel()
 
     asyncio.run(run())
-    assert [m for m in sent if m["type"] == "barge_in"] == [{"type": "barge_in"}]
+    assert any(m["type"] == "pause" for m in sent)
+    assert [m for m in sent if m["type"] == "barge_in"] == [{"type": "barge_in", "continuation": False}]
     assert agent.interrupted_flags == [False, True]
     spoken = [m["text"] for m in sent if m["type"] == "agent_text"]
     assert "aur late fee paanch sau." not in spoken  # finished after the barge-in: never spoken
@@ -241,3 +245,179 @@ def test_audio_still_playing_in_the_browser_counts_as_busy():
     asyncio.run(session.speak(from_list(["Namaste."])))
     assert session.agent_busy()  # sent instantly, but the caller hears it for a second
     assert session.playing_until - time.monotonic() > 0.9
+
+
+# --- filler while a tool runs ---
+
+from app.pipeline import session as session_module
+
+
+class ToolAgent(FakeAgent):
+    """Starts a tool call (on_tool_start) before saying its reply, like a verify turn."""
+
+    def __init__(self, tool="verify_identity", speak_first=False):
+        super().__init__({})
+        self.tool, self.speak_first = tool, speak_first
+
+    def turn(self, text, on_text, interrupted=False, on_tool_start=None, replaces_previous=False):
+        if self.speak_first:
+            on_text("Ek minute. ")
+        on_tool_start(self.tool)
+        time.sleep(0.1)  # the tool round trip
+        on_text("Dhanyavaad, aap verify ho gaye. ")
+        return False
+
+
+def run_one_turn(agent):
+    session_module._filler_pcm = b"\x00\x00" * 1600  # pretend the filler was prepared (0.1 s)
+    session, sent = voice_session(agent, range(0))
+    session.timer = TurnTimer(caller_stopped=time.monotonic())
+    asyncio.run(session.respond("Rahul Sharma, 14 May 1990"))
+    texts = [m for m in sent if m["type"] == "agent_text"]
+    return session, texts
+
+
+def test_filler_plays_when_a_tool_starts_before_anything_is_said():
+    session, texts = run_one_turn(ToolAgent())
+    assert texts[0]["text"] == session_module.FILLER_LINE and texts[0].get("filler")
+    assert texts[1]["text"] == "Dhanyavaad, aap verify ho gaye."
+    d = session.timer.durations()
+    assert d["filler_ms"] is not None and d["filler_ms"] < d["voice_to_voice_ms"]
+    assert session.said[0] == session_module.FILLER_LINE  # saved as part of what the caller heard
+
+
+def test_no_filler_before_hanging_up():
+    session, texts = run_one_turn(ToolAgent(tool="end_call"))
+    assert all(not m.get("filler") for m in texts)
+
+# "No filler after Priya already spoke" is guaranteed in run_turn (deterministic, tested in
+# test_llm.py); the session's own check is a second line that a test here could only hit by race.
+
+
+# --- pause, then decide: backchannels and continuations ---
+
+from app.pipeline.session import ANSWER_WINDOW_S, is_backchannel
+
+
+def test_backchannel_words():
+    assert is_backchannel("Haan.") and is_backchannel("haan haan, theek hai") and is_backchannel("हाँ")
+    assert not is_backchannel("ruko") and not is_backchannel("haan par amount galat hai")
+    assert not is_backchannel("")
+
+
+def held_session(remaining_s):
+    session, sent = voice_session(FakeAgent({}), range(0, 2 * BARGE_IN_FRAMES))
+    session.playing_until = time.monotonic() + remaining_s  # Priya's audio still playing
+
+    async def speak_over():
+        for _ in range(2 * BARGE_IN_FRAMES):
+            await session.on_frame(FRAME)
+    asyncio.run(speak_over())
+    assert session.held and any(m["type"] == "pause" for m in sent)
+    return session, sent
+
+
+def test_haan_while_priya_talks_resumes_her_and_is_not_a_turn():
+    session, sent = held_session(remaining_s=5)
+    asyncio.run(session.on_final("Haan.", TurnTimer()))
+    assert sent[-1] == {"type": "resume"} and not session.held
+    assert session.user_turns.empty()
+    assert not any(m["type"] == "barge_in" for m in sent)
+
+
+def test_haan_in_her_last_second_is_an_answer():
+    session, sent = held_session(remaining_s=ANSWER_WINDOW_S / 2)
+    asyncio.run(session.on_final("Haan ji.", TurnTimer()))
+    assert sent[-1] == {"type": "resume"}
+    assert session.user_turns.get_nowait()[0] == "Haan ji."
+
+
+def test_noise_with_no_words_resumes_her():
+    session, sent = held_session(remaining_s=5)
+    asyncio.run(session.on_final("", TurnTimer()))
+    assert sent[-1] == {"type": "resume"} and session.user_turns.empty()
+
+
+def test_a_real_interruption_after_the_pause_is_a_barge_in():
+    session, sent = held_session(remaining_s=5)
+    asyncio.run(session.on_final("Ruko, amount galat hai.", TurnTimer()))
+    assert any(m["type"] == "barge_in" for m in sent) and session.interrupted
+    assert session.user_turns.get_nowait()[0] == "Ruko, amount galat hai."
+
+
+def test_pause_times_out_if_no_transcript_comes(monkeypatch):
+    monkeypatch.setattr(session_module, "HOLD_TIMEOUT_S", 0.05)
+    session, sent = voice_session(FakeAgent({}), range(0, 2 * BARGE_IN_FRAMES))  # speech, then silence
+    session.playing_until = time.monotonic() + 5
+
+    async def run():
+        for _ in range(2 * BARGE_IN_FRAMES + 30):  # long enough for the VAD to end the utterance
+            await session.on_frame(FRAME)
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
+    assert sent[-1] == {"type": "resume"}
+
+
+class ThinkingAgent(FakeAgent):
+    """Thinks (says nothing) until released: the caller can continue before Priya speaks."""
+
+    def __init__(self):
+        super().__init__({})
+        self.calls = []  # (text, replaces_previous)
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def turn(self, text, on_text, interrupted=False, on_tool_start=None, replaces_previous=False):
+        self.calls.append((text, replaces_previous))
+        if len(self.calls) == 1:
+            self.started.set()
+            self.release.wait(5)
+            on_text("Ji, aapki DOB kya hai? ")  # too late: never spoken
+            return False
+        on_text("Dhanyavaad. ")
+        return False
+
+
+def test_caller_continuing_before_priya_speaks_is_one_merged_turn():
+    agent = ThinkingAgent()
+    session, sent = voice_session(agent, range(0, 2 * BARGE_IN_FRAMES))
+
+    async def run():
+        conversation = asyncio.create_task(session.converse())
+        session.user_turns.put_nowait(("Meri date of birth hai", TurnTimer()))
+        while not agent.started.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        for _ in range(2 * BARGE_IN_FRAMES):  # the caller carries on after a pause
+            await session.on_frame(FRAME)
+        await session.on_final("chaudah May unnees sau nabbe", TurnTimer())
+        agent.release.set()
+        await asyncio.sleep(0.3)
+        conversation.cancel()
+
+    asyncio.run(run())
+    assert [m for m in sent if m["type"] == "barge_in"] == [{"type": "barge_in", "continuation": True}]
+    assert agent.calls[1] == ("Meri date of birth hai chaudah May unnees sau nabbe", True)
+    assert [row[0] for row in agent.saved] == [None, "Meri date of birth hai chaudah May unnees sau nabbe"]
+    assert not session.interrupted  # nothing real was said, so nothing was "missed"
+
+
+def test_call_agent_replaces_the_rolled_back_fragment(session):
+    client = FakeClient([text_response("Ji, aapki DOB? "), text_response("Dhanyavaad. ")])
+    agent = CallAgent(session, client, loan_id=1, allow_off_hours=True)
+    agent.turn("Meri DOB hai", lambda s: None)
+    agent.turn("Meri DOB hai chaudah May", lambda s: None, replaces_previous=True)
+    users = [m["content"] for m in agent.messages if isinstance(m, dict) and m.get("role") == "user"]
+    assert users == ["Meri DOB hai chaudah May"]  # the fragment and its unspoken reply are gone
+
+
+def test_reply_that_arrived_while_paused_was_never_heard_so_it_is_a_continuation():
+    # Seen live: Priya's answer to the first fragment was generated and sent while she was
+    # paused for the caller; it never played, so the caller was still mid-sentence.
+    session, sent = held_session(remaining_s=2)  # busy: her (unheard) audio is queued
+    session.reply_text = "Meri date of birth hai"
+    session.timer.first_audio = session.paused_at + 0.5  # her audio started only after the pause
+    asyncio.run(session.on_final("chaudah May unnees sau nabbe", TurnTimer()))
+    assert [m for m in sent if m["type"] == "barge_in"] == [{"type": "barge_in", "continuation": True}]
+    assert session.continuation_text == "Meri date of birth hai" and not session.interrupted

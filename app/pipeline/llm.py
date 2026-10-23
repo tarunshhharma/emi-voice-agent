@@ -128,11 +128,14 @@ def run_tool(session: Session, call_id: int, name: str, arguments: str) -> dict:
     return result
 
 
-def run_turn(client, session: Session, call_id: int, messages: list, on_text=print) -> str:
+def run_turn(client, session: Session, call_id: int, messages: list, on_text=print, on_tool_start=None) -> str:
     """Stream one agent turn. Runs any tool calls, feeds results back, and repeats
-    until the model answers in plain text. Returns what was said."""
+    until the model answers in plain text. Returns what was said.
+    on_tool_start(name): called once, when the model starts its first tool call before
+    saying anything, so the voice path can fill the silence of the tool round trips."""
     model = os.getenv("OPENAI_MODEL") or "gpt-6-luna"
     spoken = []
+    tool_announced = False
     call = session.get(Call, call_id)
     loan = session.get(Loan, call.loan_id)
 
@@ -171,7 +174,13 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         buffer = ""
         spoken_item = None  # output_index of the one message item we speak in this response
         for event in stream:
-            if event.type == "response.output_item.added" and event.item.type == "message":
+            if event.type == "response.output_item.added" and event.item.type == "function_call":
+                # Each tool round trip costs a full extra LLM request (~1-1.5 s). The stream
+                # announces the call long before it completes, so the caller can hear a filler now.
+                if on_tool_start and not spoken and not tool_announced:
+                    tool_announced = True
+                    on_tool_start(event.item.name)
+            elif event.type == "response.output_item.added" and event.item.type == "message":
                 # One response can hold a "commentary" and then a "final_answer" message that
                 # repeat each other, often reworded, so the caller would hear it twice. Speak
                 # the first (it arrives first: lower latency); later ones stay in the history only.
@@ -197,8 +206,10 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         tool_calls = [item for item in output if item.type == "function_call"]
         if not tool_calls:
             break
+        deferred = False
         for tool_call in tool_calls:
             if tool_call.name in NEEDS_CALLER_ANSWER and any(s.endswith("?") for s in spoken):
+                deferred = True
                 # Found by evals (end_call) and the voice path (verify_identity): the model asked
                 # for the DOB, then hung up or "verified" with invented digits in the same turn.
                 # It can't have the answer to a question it just asked, so wait for it.
@@ -212,6 +223,10 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
             messages.append(
                 {"type": "function_call_output", "call_id": tool_call.call_id, "output": json.dumps(result)}
             )
+        if deferred:
+            # The question is already asked; the turn is over until the caller answers. Another
+            # request here only made the model apologise and repeat itself (seen live), and cost ~1-2 s.
+            break
     if get_state(call) == State.DONE:  # the goodbye has been said: close the call
         call.ended_at = utcnow()
         session.commit()
