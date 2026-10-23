@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -8,9 +9,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse
 
+from app.agent.prompts import opening
 from app.pipeline import audio, vad
 from app.pipeline.session import VoiceSession
 from app.pipeline.stt import make_stt
+from app.pipeline.tts.elevenlabs import ElevenLabsTTS
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -43,13 +46,13 @@ def browser_client():
 def _log_task_failure(task: asyncio.Task) -> None:
     """A background task that crashes is otherwise silent until someone awaits it."""
     if not task.cancelled() and task.exception():
-        log.warning("transcript task stopped: %r", task.exception())
+        log.warning("%s task stopped: %r", task.get_name(), task.exception())
 
 
 @app.websocket("/ws/browser")
 async def browser_audio(ws: WebSocket):
-    """Browser mic -> VAD -> streaming STT -> transcripts back to the browser.
-    The audio is also saved, to build the clip set for the WER test."""
+    """Browser mic -> VAD -> streaming STT -> transcripts back to the browser, and agent
+    speech (TTS) back as binary PCM. The mic audio is also saved, for test clips."""
     await ws.accept()
     try:
         stt = make_stt()  # Sarvam by default; STT_PROVIDER=deepgram in .env to switch
@@ -63,15 +66,24 @@ async def browser_audio(ws: WebSocket):
     send_lock = asyncio.Lock()
 
     async def send_json(message: dict) -> None:
-        # Two tasks send to this socket (VAD events and transcripts); one at a time.
+        # Several tasks send to this socket (VAD events, transcripts, agent audio); one at a time.
         async with send_lock:
             await ws.send_json(message)
 
-    session = VoiceSession(vad.SileroVAD(), stt, send_json)
-    # Two things happen at once for the whole call: frames come in from the browser,
-    # and transcripts come back from the STT provider. Each gets its own task.
-    forwarder = asyncio.create_task(session.forward_transcripts())
+    async def send_audio(pcm: bytes) -> None:
+        async with send_lock:
+            await ws.send_bytes(pcm)
+
+    session = VoiceSession(vad.SileroVAD(), stt, send_json, tts=ElevenLabsTTS(), send_audio=send_audio)
+    # Things happen at once for the whole call: frames come in from the browser,
+    # transcripts come back from STT, and the agent speaks. Each gets its own task.
+    forwarder = asyncio.create_task(session.forward_transcripts(), name="transcript")
     forwarder.add_done_callback(_log_task_failure)
+    # The disclosure line is fixed in code and spoken first. Task 2 replaces the fixed
+    # name with the borrower being called and hands the turns to the agent.
+    sentences = re.split(r"(?<=[.?!])\s+", opening("Rahul Sharma"))
+    speaker = asyncio.create_task(session.speak(sentences), name="speak")
+    speaker.add_done_callback(_log_task_failure)
     frames: list[bytes] = []
     try:
         while True:
@@ -85,6 +97,7 @@ async def browser_audio(ws: WebSocket):
             await session.on_frame(data)
     finally:
         forwarder.cancel()
+        speaker.cancel()
         await stt.close()
         if frames:
             name = f"browser-{datetime.now():%Y%m%d-%H%M%S}.wav"

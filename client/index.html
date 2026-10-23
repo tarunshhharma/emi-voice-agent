@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EMI Voice Agent · Mic</title>
+<title>EMI Voice Agent · Call</title>
 <style>
   :root { --bg: #f5f6f3; --ink: #1b2321; --muted: #56645f; --line: #d6dbd5; --accent: #0e6f62; }
   @media (prefers-color-scheme: dark) {
@@ -26,13 +26,14 @@
   .partial { color: var(--muted); font-style: italic; min-height: 1.5em; margin: 0; }
   ol.finals { margin: 0; padding-left: 1.4rem; display: grid; gap: 0.3rem; }
   ol.finals small { color: var(--muted); font-variant-numeric: tabular-nums; }
+  ol.finals li.agent { color: var(--accent); }
 </style>
 </head>
 <body>
 <main>
-  <h1>Live transcript</h1>
-  <p class="hint">Speak Hindi, English or Hinglish. Silero VAD on the server detects when you start and stop; Sarvam turns each turn into text. The recording is saved in <code>recordings/</code> when you stop.</p>
-  <button id="toggle">Start mic</button>
+  <h1>Live call</h1>
+  <p class="hint">Priya speaks first. Then speak Hindi, English or Hinglish: Silero VAD on the server detects when you start and stop, and Sarvam turns each turn into text. Use headphones, or the mic hears Priya too. Your audio is saved in <code>recordings/</code> when you stop.</p>
+  <button id="toggle">Start call</button>
   <div class="meter" aria-label="Mic level"><div id="level"></div></div>
   <dl>
     <dt>Status</dt><dd id="status">Idle</dd>
@@ -82,6 +83,30 @@ registerProcessor("pcm16-frames", Pcm16Frames);
 
 const $ = (id) => document.getElementById(id);
 let ws, stream, ctx, sent = 0;
+let playAt = 0;  // when the next audio chunk should start, in AudioContext time
+
+// Agent speech arrives as 16 kHz 16-bit PCM chunks. Schedule each one right after the
+// previous, so chunks play back to back without gaps however the network delivers them.
+function play(buffer) {
+  const pcm = new Int16Array(buffer, 0, buffer.byteLength >> 1);
+  const audio = ctx.createBuffer(1, pcm.length, 16000);  // the browser resamples to its own rate
+  const out = audio.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource();
+  src.buffer = audio;
+  src.connect(ctx.destination);
+  playAt = Math.max(playAt, ctx.currentTime);
+  src.start(playAt);
+  playAt += audio.duration;
+}
+
+function addLine(text, cls) {
+  const li = document.createElement("li");
+  li.textContent = text + " ";
+  if (cls) li.className = cls;
+  $("finals").append(li);
+  return li;
+}
 
 function levelPercent(frameBuffer) {
   const s = new Int16Array(frameBuffer);
@@ -93,12 +118,23 @@ function levelPercent(frameBuffer) {
 
 async function start() {
   $("status").textContent = "Connecting…";
+  // Created first, inside the click, so audio may play (autoplay rules) even if the agent
+  // starts speaking while the mic permission prompt is still open.
+  ctx = new AudioContext();
+  playAt = 0;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${scheme}://${location.host}/ws/browser`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) return play(e.data);  // binary = agent audio
     const m = JSON.parse(e.data);
-    if (m.type === "vad") {
+    if (m.type === "agent_text") {
+      addLine(`Priya: ${m.text}`, "agent");
+    } else if (m.type === "tts") {
+      const t = document.createElement("small");
+      t.textContent = `(first audio ${m.first_audio_ms} ms)`;
+      $("finals").lastElementChild?.append(t);
+    } else if (m.type === "vad") {
       $("voice").textContent = m.speaking ? "speaking" : "silent";
       $("voice").classList.toggle("on", m.speaking);
     } else if (m.type === "transcript" && !m.final) {
@@ -106,14 +142,12 @@ async function start() {
     } else if (m.type === "transcript" && m.final) {
       $("partial").textContent = "";
       if (!m.text.trim()) return;
-      const li = document.createElement("li");
-      li.textContent = m.text + " ";
+      const li = addLine(`You: ${m.text}`);
       if (m.stt_ms !== undefined) {
         const t = document.createElement("small");
         t.textContent = `(final ${m.stt_ms} ms after you stopped)`;
         li.append(t);
       }
-      $("finals").append(li);
     } else if (m.type === "error") {
       $("status").textContent = m.message;
     }
@@ -124,7 +158,6 @@ async function start() {
   stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
-  ctx = new AudioContext();
   $("rate").textContent = `${ctx.sampleRate} Hz → 16000 Hz`;
   const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
   await ctx.audioWorklet.addModule(url);
@@ -145,7 +178,7 @@ async function start() {
     }
   };
   $("status").textContent = "Streaming";
-  $("toggle").textContent = "Stop mic";
+  $("toggle").textContent = "End call";
   $("toggle").classList.add("stop");
 }
 
@@ -155,7 +188,7 @@ async function stop() {
   ws?.close();
   $("level").style.width = "0";
   $("status").textContent = "Stopped: recording saved on the server";
-  $("toggle").textContent = "Start mic";
+  $("toggle").textContent = "Start call";
   $("toggle").classList.remove("stop");
   stream = ctx = null;
 }
