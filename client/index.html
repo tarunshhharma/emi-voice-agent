@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EMI Voice Agent · Mic</title>
+<style>
+  :root { --bg: #f5f6f3; --ink: #1b2321; --muted: #56645f; --line: #d6dbd5; --accent: #0e6f62; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111614; --ink: #e2e9e5; --muted: #97a6a0; --line: #2b3531; --accent: #45c2ab; }
+  }
+  body { background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem 16px; }
+  main { max-width: 34rem; margin: 0 auto; display: grid; gap: 1.2rem; }
+  h1 { font-size: 1.5rem; margin: 0; }
+  button { font: inherit; padding: 0.6rem 1.4rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--bg); cursor: pointer; justify-self: start; }
+  button.stop { background: transparent; color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .meter { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; }
+  .meter div { height: 100%; width: 0; background: var(--accent); transition: width 60ms linear; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0; font-variant-numeric: tabular-nums; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  .hint { color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mic check</h1>
+  <p class="hint">Streams your microphone to the server as 16 kHz, 16-bit mono PCM in 20 ms frames. When you stop, the server saves the recording in <code>recordings/</code>.</p>
+  <button id="toggle">Start mic</button>
+  <div class="meter" aria-label="Mic level"><div id="level"></div></div>
+  <dl>
+    <dt>Status</dt><dd id="status">Idle</dd>
+    <dt>Browser rate</dt><dd id="rate">–</dd>
+    <dt>Frames sent</dt><dd id="sent">0</dd>
+    <dt>Server received</dt><dd id="server">–</dd>
+  </dl>
+</main>
+
+<script>
+// Runs on the audio thread. Converts the browser's float samples (usually 48 kHz) into
+// 16 kHz 16-bit integers and posts them in 320-sample (20 ms) frames.
+const WORKLET = `
+class Pcm16Frames extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.step = sampleRate / 16000;   // e.g. 48000 / 16000 = 3 input samples per output sample
+    this.pos = 0;
+    this.frame = new Int16Array(320);
+    this.n = 0;
+  }
+  process(inputs) {
+    const input = inputs[0][0];
+    if (!input) return true;
+    while (this.pos < input.length) {
+      // Linear interpolation between neighbouring samples (simple resampling, no low-pass filter).
+      const i = Math.floor(this.pos);
+      const frac = this.pos - i;
+      const next = i + 1 < input.length ? input[i + 1] : input[i];
+      const s = Math.max(-1, Math.min(1, input[i] + (next - input[i]) * frac));
+      this.frame[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (this.n === 320) {
+        this.port.postMessage(this.frame.buffer, [this.frame.buffer]);  // transfer, no copy
+        this.frame = new Int16Array(320);
+        this.n = 0;
+      }
+      this.pos += this.step;
+    }
+    this.pos -= input.length;
+    return true;
+  }
+}
+registerProcessor("pcm16-frames", Pcm16Frames);
+`;
+
+const $ = (id) => document.getElementById(id);
+let ws, stream, ctx, sent = 0;
+
+function levelPercent(frameBuffer) {
+  const s = new Int16Array(frameBuffer);
+  let sum = 0;
+  for (const v of s) sum += v * v;
+  const db = 20 * Math.log10(Math.sqrt(sum / s.length) / 32768 || 1e-5);
+  return Math.max(0, Math.min(100, (db + 60) * (100 / 60)));  // -60 dB .. 0 dB -> 0 .. 100%
+}
+
+async function start() {
+  $("status").textContent = "Connecting…";
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${scheme}://${location.host}/ws/browser`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "stats") {
+      $("server").textContent = `${m.seconds.toFixed(0)} s, level ${m.level_db} dBFS, bad frames ${m.bad_frames}`;
+    }
+  };
+  ws.onclose = () => { $("status").textContent = "Disconnected"; };
+  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  ctx = new AudioContext();
+  $("rate").textContent = `${ctx.sampleRate} Hz → 16000 Hz`;
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+
+  const source = ctx.createMediaStreamSource(stream);
+  const frames = new AudioWorkletNode(ctx, "pcm16-frames");
+  const mute = ctx.createGain();
+  mute.gain.value = 0;  // keeps the node running without playing your voice back
+  source.connect(frames).connect(mute).connect(ctx.destination);
+
+  sent = 0;
+  frames.port.onmessage = (e) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(e.data);
+    sent += 1;
+    if (sent % 5 === 0) {
+      $("sent").textContent = sent;
+      $("level").style.width = levelPercent(e.data) + "%";
+    }
+  };
+  $("status").textContent = "Streaming";
+  $("toggle").textContent = "Stop mic";
+  $("toggle").classList.add("stop");
+}
+
+async function stop() {
+  stream?.getTracks().forEach((t) => t.stop());
+  await ctx?.close();
+  ws?.close();
+  $("level").style.width = "0";
+  $("status").textContent = "Stopped: recording saved on the server";
+  $("toggle").textContent = "Start mic";
+  $("toggle").classList.remove("stop");
+  stream = ctx = null;
+}
+
+$("toggle").addEventListener("click", () => {
+  (stream ? stop() : start()).catch((err) => {
+    $("status").textContent = `Error: ${err.message || err}`;
+  });
+});
+</script>
+</body>
+</html>
