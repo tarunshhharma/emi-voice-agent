@@ -73,3 +73,45 @@ def test_agent_cannot_hang_up_on_its_own_question(session):
     run_turn(FakeClient([asks_then_hangs_up, text_response("Ji, bataiye.")]), session, call.id, [],
              on_text=lambda d: None)
     assert call.ended_at is None
+
+
+def test_reworded_final_answer_after_commentary_is_not_spoken(session):
+    # Seen live in the voice path: a "commentary" message, then a reworded "final_answer"
+    # in the same response. The caller heard the question twice.
+    from types import SimpleNamespace as NS
+
+    first = "Kya aap apna poora naam aur date of birth bata sakte hain?"
+    second = "Aap apna poora naam aur date of birth bata sakte hain?"
+    events = []
+    for index, (phase, text) in enumerate([("commentary", first), ("final_answer", second)]):
+        events.append(NS(type="response.output_item.added", output_index=index,
+                         item=NS(type="message", phase=phase)))
+        events.append(NS(type="response.output_text.delta", output_index=index, delta=text))
+        events.append(NS(type="response.output_text.done", output_index=index))
+    events.append(NS(type="response.completed", response=NS(output=[NS(type="message")] * 2)))
+
+    call = start_call(session, 1)
+    heard = []
+    said = run_turn(FakeClient([events]), session, call.id, [], on_text=heard.append)
+    assert said == first
+    assert heard == [first + " "]
+
+
+def test_verify_in_the_same_turn_as_our_question_is_deferred_and_not_a_failed_attempt(session):
+    # Seen live: Priya asked for the DOB, then called verify_identity with invented digits.
+    from app.agent.tools import _failed_verifications
+    from app.db.models import Event
+    from types import SimpleNamespace as NS
+
+    question = text_response("Apni date of birth bataiye?")
+    verify = tool_response("verify_identity", {"name": "Rahul Sharma", "dob_or_last4": "1234"})
+    asked_then_verified = question[:-1] + [NS(type="response.completed", response=NS(
+        output=question[-1].response.output + verify[-1].response.output))]
+    client = FakeClient([asked_then_verified, text_response("Main aapke jawab ka intezaar karti hoon. ")])
+
+    call = start_call(session, 1)
+    run_turn(client, session, call.id, [], on_text=lambda d: None)
+    assert _failed_verifications(session, call.id) == 0
+    deferred = session.query(Event).filter_by(call_id=call.id, tool_name="deferred_tool").one()
+    assert json.loads(deferred.args_json) == {"tool": "verify_identity"}
+    assert call.verified is False

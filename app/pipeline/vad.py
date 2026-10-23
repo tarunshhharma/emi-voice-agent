@@ -80,3 +80,9 @@ class SileroVAD:
                     self.speaking = False
                     events.append("speech_end")
         return events
+
+    @property
+    def voiced(self) -> bool:
+        """Speech in the latest window, not just inside the silence tail of a turn.
+        Barge-in counts these, so 300 ms of real speech is needed, not "haan" plus a pause."""
+        return self.speaking and self._silent_for_ms == 0

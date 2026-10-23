@@ -16,6 +16,7 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 5  # stops a model that keeps calling tools forever
+NEEDS_CALLER_ANSWER = {"end_call", "verify_identity"}  # never in the same turn as our own question
 SENTENCE_END = re.compile(r"[.!?।]\s")  # needs the space after, so "3.5" is not split
 
 def _schema(tool_name: str, description: str, /, **properties) -> dict:
@@ -168,15 +169,24 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         stream = client.responses.create(**request)
         output = []
         buffer = ""
+        spoken_item = None  # output_index of the one message item we speak in this response
         for event in stream:
-            if event.type == "response.output_text.delta":
+            if event.type == "response.output_item.added" and event.item.type == "message":
+                # One response can hold a "commentary" and then a "final_answer" message that
+                # repeat each other, often reworded, so the caller would hear it twice. Speak
+                # the first (it arrives first: lower latency); later ones stay in the history only.
+                if spoken_item is None:
+                    spoken_item = event.output_index
+                else:
+                    log.info("not speaking extra message item (phase=%s)", getattr(event.item, "phase", None))
+            elif getattr(event, "output_index", spoken_item) != spoken_item:
+                continue  # text of an extra message item
+            elif event.type == "response.output_text.delta":
                 buffer += event.delta
                 while match := SENTENCE_END.search(buffer):  # speak each finished sentence
                     say(buffer[: match.end()])
                     buffer = buffer[match.end():]
             elif event.type == "response.output_text.done":
-                # One response can hold several message items (e.g. a "commentary" and a
-                # "final_answer", sometimes identical). Each item ends a sentence.
                 say(buffer)
                 buffer = ""
             elif event.type == "response.completed":
@@ -188,11 +198,14 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         if not tool_calls:
             break
         for tool_call in tool_calls:
-            if tool_call.name == "end_call" and any(s.endswith("?") for s in spoken):
-                # Found by evals: the model asked for the DOB and hung up in the same turn.
-                # Hanging up on a question we just asked is never right, so wait for the answer.
+            if tool_call.name in NEEDS_CALLER_ANSWER and any(s.endswith("?") for s in spoken):
+                # Found by evals (end_call) and the voice path (verify_identity): the model asked
+                # for the DOB, then hung up or "verified" with invented digits in the same turn.
+                # It can't have the answer to a question it just asked, so wait for it.
+                # Logged under its own name so it never counts as a failed verification.
                 result = tools.log_event(
-                    session, call_id, "end_call", {}, {"ok": False, "error": "wait_for_caller_answer"}
+                    session, call_id, "deferred_tool", {"tool": tool_call.name},
+                    {"ok": False, "error": "wait_for_caller_answer"},
                 )
             else:
                 result = run_tool(session, call_id, tool_call.name, tool_call.arguments)

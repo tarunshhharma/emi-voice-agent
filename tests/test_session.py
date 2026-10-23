@@ -23,6 +23,10 @@ class FakeVAD:
         self.i += 1
         return events
 
+    @property
+    def voiced(self):
+        return self.speaking
+
 
 class FakeSTT:
     def __init__(self, transcripts=()):

@@ -32,7 +32,7 @@
 <body>
 <main>
   <h1>Live call</h1>
-  <p class="hint">Priya speaks first. Then speak Hindi, English or Hinglish: Silero VAD on the server detects when you start and stop, and Sarvam turns each turn into text. Use headphones, or the mic hears Priya too. Your audio is saved in <code>recordings/</code> when you stop.</p>
+  <p class="hint">Priya calls the borrower below (add <code>?loan=5</code> to the URL for another). Answer in Hindi, English or Hinglish. You can interrupt her by talking over her. Use headphones, or the mic hears Priya too. Your audio is saved in <code>recordings/</code> when you end the call.</p>
   <button id="toggle">Start call</button>
   <div class="meter" aria-label="Mic level"><div id="level"></div></div>
   <dl>
@@ -40,6 +40,7 @@
     <dt>Browser rate</dt><dd id="rate">–</dd>
     <dt>Frames sent</dt><dd id="sent">0</dd>
     <dt>Voice</dt><dd><span id="voice" class="voice">silent</span></dd>
+    <dt>Borrower</dt><dd id="dev">–</dd>
   </dl>
   <p id="partial" class="partial" aria-live="polite"></p>
   <ol id="finals" class="finals"></ol>
@@ -84,6 +85,7 @@ registerProcessor("pcm16-frames", Pcm16Frames);
 const $ = (id) => document.getElementById(id);
 let ws, stream, ctx, sent = 0;
 let playAt = 0;  // when the next audio chunk should start, in AudioContext time
+let queued = [];  // chunks scheduled but not finished, so barge-in can stop them all
 
 // Agent speech arrives as 16 kHz 16-bit PCM chunks. Schedule each one right after the
 // previous, so chunks play back to back without gaps however the network delivers them.
@@ -98,11 +100,24 @@ function play(buffer) {
   playAt = Math.max(playAt, ctx.currentTime);
   src.start(playAt);
   playAt += audio.duration;
+  queued.push(src);
+  src.onended = () => { queued = queued.filter((q) => q !== src); };
 }
+
+// Barge-in: the caller spoke over Priya. Stop what is playing and drop everything queued.
+function flush() {
+  for (const src of queued) src.stop();
+  queued = [];
+  playAt = 0;
+}
+
+let agentLine = null;  // the "Priya:" line that sentences of the current reply are added to
 
 function addLine(text, cls) {
   const li = document.createElement("li");
-  li.textContent = text + " ";
+  const span = document.createElement("span");
+  span.textContent = text + " ";
+  li.append(span);
   if (cls) li.className = cls;
   $("finals").append(li);
   return li;
@@ -123,17 +138,36 @@ async function start() {
   ctx = new AudioContext();
   playAt = 0;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${scheme}://${location.host}/ws/browser`);
+  const loan = new URLSearchParams(location.search).get("loan") || "1";  // ?loan=5 calls another borrower
+  ws = new WebSocket(`${scheme}://${location.host}/ws/browser?loan=${encodeURIComponent(loan)}`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) return play(e.data);  // binary = agent audio
     const m = JSON.parse(e.data);
     if (m.type === "agent_text") {
-      addLine(`Priya: ${m.text}`, "agent");
+      // A reply arrives sentence by sentence, while it is still being written.
+      if (m.first || !agentLine) agentLine = addLine(`Priya: ${m.text}`, "agent");
+      else agentLine.firstChild.textContent += m.text + " ";
     } else if (m.type === "tts") {
       const t = document.createElement("small");
       t.textContent = `(first audio ${m.first_audio_ms} ms)`;
-      $("finals").lastElementChild?.append(t);
+      agentLine?.append(t);
+    } else if (m.type === "latency" && m.voice_to_voice_ms != null) {
+      // Where the wait went: you stopped -> VAD sure -> STT final -> first sentence -> first audio.
+      const t = document.createElement("small");
+      t.textContent = ` voice-to-voice ${m.voice_to_voice_ms} ms = endpoint ${m.endpoint_ms} + STT ${m.stt_ms}`
+        + ` + LLM ${m.llm_ttft_ms} + TTS ${m.tts_first_byte_ms} (+ queue)`;
+      t.style.display = "block";
+      agentLine?.append(t);
+    } else if (m.type === "barge_in") {
+      flush();
+      const t = document.createElement("small");
+      t.textContent = "(interrupted)";
+      agentLine?.append(t);
+    } else if (m.type === "dev") {
+      $("dev").textContent = m.text;
+    } else if (m.type === "ended") {
+      $("status").textContent = "Call ended by Priya";
     } else if (m.type === "vad") {
       $("voice").textContent = m.speaking ? "speaking" : "silent";
       $("voice").classList.toggle("on", m.speaking);

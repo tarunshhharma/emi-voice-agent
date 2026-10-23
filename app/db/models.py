@@ -69,9 +69,13 @@ class Turn(Base):
     call_id: Mapped[int] = mapped_column(ForeignKey("calls.id"))
     speaker: Mapped[str]  # agent / caller
     text: Mapped[str] = mapped_column(Text)
+    # Latency per stage (voice calls only; see app/pipeline/metrics.py for exact definitions)
     stt_ms: Mapped[int | None]
-    llm_ttft_ms: Mapped[int | None]
+    llm_ttft_ms: Mapped[int | None]  # to the first speakable sentence, which is what gates TTS
     tts_first_byte_ms: Mapped[int | None]
+    endpoint_ms: Mapped[int | None]  # the VAD's silence wait
+    voice_to_voice_ms: Mapped[int | None]  # caller stopped -> first agent audio: what the caller feels
+    barge_in_ms: Mapped[int | None]  # caller spoke over the agent -> stop sent
     interrupted: Mapped[bool] = mapped_column(default=False)
 
 

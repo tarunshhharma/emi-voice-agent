@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import re
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -8,9 +8,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse
+from openai import OpenAI
 
-from app.agent.prompts import opening
+from app.db.models import SessionLocal
 from app.pipeline import audio, vad
+from app.pipeline.call import CallAgent, CallBlocked
 from app.pipeline.session import VoiceSession
 from app.pipeline.stt import make_stt
 from app.pipeline.tts.elevenlabs import ElevenLabsTTS
@@ -51,9 +53,25 @@ def _log_task_failure(task: asyncio.Task) -> None:
 
 @app.websocket("/ws/browser")
 async def browser_audio(ws: WebSocket):
-    """Browser mic -> VAD -> streaming STT -> transcripts back to the browser, and agent
-    speech (TTS) back as binary PCM. The mic audio is also saved, for test clips."""
+    """A full spoken call: browser mic -> VAD -> STT -> agent -> TTS -> binary PCM back.
+    ?loan=<id> picks the borrower (default 1). The mic audio is also saved, for test clips."""
     await ws.accept()
+    db = SessionLocal()
+    try:
+        # Opening the call reads and writes the DB, so it runs in a thread like every agent turn.
+        agent = await asyncio.to_thread(
+            CallAgent, db, OpenAI(), int(ws.query_params.get("loan", 1)),
+            allow_off_hours=os.getenv("ALLOW_OFF_HOURS") == "1",
+        )
+    except (CallBlocked, ValueError) as e:  # guardrail refused, or a bad loan id
+        log.info("call not started: %s", e)
+        await ws.send_json({"type": "error", "message": f"Call not started: {e}"})
+        await ws.close()
+        db.close()
+        return
+    b = agent.borrower
+    # Synthetic data, shown only in the browser so you know what to say (never logged).
+    await ws.send_json({"type": "dev", "text": f"{b.name}, DOB {b.dob:%d-%m-%Y}, phone ends {b.phone[-4:]}"})
     try:
         stt = make_stt()  # Sarvam by default; STT_PROVIDER=deepgram in .env to switch
         await stt.connect()
@@ -61,6 +79,7 @@ async def browser_audio(ws: WebSocket):
         log.warning("STT connect failed: %s", e)
         await ws.send_json({"type": "error", "message": f"Speech-to-text unavailable: {e}"})
         await ws.close()
+        await asyncio.to_thread(agent.close)
         return
 
     send_lock = asyncio.Lock()
@@ -74,16 +93,14 @@ async def browser_audio(ws: WebSocket):
         async with send_lock:
             await ws.send_bytes(pcm)
 
-    session = VoiceSession(vad.SileroVAD(), stt, send_json, tts=ElevenLabsTTS(), send_audio=send_audio)
+    session = VoiceSession(vad.SileroVAD(), stt, send_json, tts=ElevenLabsTTS(), send_audio=send_audio, agent=agent)
     # Things happen at once for the whole call: frames come in from the browser,
     # transcripts come back from STT, and the agent speaks. Each gets its own task.
     forwarder = asyncio.create_task(session.forward_transcripts(), name="transcript")
     forwarder.add_done_callback(_log_task_failure)
-    # The disclosure line is fixed in code and spoken first. Task 2 replaces the fixed
-    # name with the borrower being called and hands the turns to the agent.
-    sentences = re.split(r"(?<=[.?!])\s+", opening("Rahul Sharma"))
-    speaker = asyncio.create_task(session.speak(sentences), name="speak")
-    speaker.add_done_callback(_log_task_failure)
+    # The opening (fixed in code: it carries the disclosure), then one agent turn per final transcript.
+    conversation = asyncio.create_task(session.converse(), name="conversation")
+    conversation.add_done_callback(_log_task_failure)
     frames: list[bytes] = []
     try:
         while True:
@@ -97,8 +114,9 @@ async def browser_audio(ws: WebSocket):
             await session.on_frame(data)
     finally:
         forwarder.cancel()
-        speaker.cancel()
+        conversation.cancel()
         await stt.close()
+        await asyncio.to_thread(agent.close)
         if frames:
             name = f"browser-{datetime.now():%Y%m%d-%H%M%S}.wav"
             path = await asyncio.to_thread(audio.save_wav, RECORDINGS / name, b"".join(frames))
