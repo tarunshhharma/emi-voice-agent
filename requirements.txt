@@ -6,3 +6,5 @@ sqlalchemy==2.1.5
 faker==40.43.0
 openai==3.35.1
 pytest==9.1.1
+numpy==2.4.6
+onnxruntime==1.30.0

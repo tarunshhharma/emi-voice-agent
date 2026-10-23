@@ -1,18 +1,33 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse
 
-from app.pipeline import audio
+from app.pipeline import audio, vad
+from app.pipeline.session import VoiceSession
+from app.pipeline.stt.sarvam import SarvamSTT
 
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS = ROOT / "recordings"
 
-app = FastAPI(title="EMI Voice Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load (and on first run download) the VAD model before any call arrives,
+    # in a thread so startup doesn't block the event loop.
+    await asyncio.to_thread(vad.load_model)
+    yield
+
+
+app = FastAPI(title="EMI Voice Agent", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -25,35 +40,53 @@ def browser_client():
     return FileResponse(ROOT / "client" / "index.html")
 
 
+def _log_task_failure(task: asyncio.Task) -> None:
+    """A background task that crashes is otherwise silent until someone awaits it."""
+    if not task.cancelled() and task.exception():
+        log.warning("transcript task stopped: %r", task.exception())
+
+
 @app.websocket("/ws/browser")
 async def browser_audio(ws: WebSocket):
-    """Receive 20 ms PCM frames from the browser mic. For now: report what arrives and
-    save the recording, so we can check the audio before VAD and STT are added."""
+    """Browser mic -> VAD -> streaming STT -> transcripts back to the browser.
+    The audio is also saved, to build the clip set for the WER test."""
     await ws.accept()
-    frames: list[bytes] = []
-    bad_frames = 0
-    while True:
-        message = await ws.receive()
-        if message["type"] == "websocket.disconnect":
-            break
-        data = message.get("bytes")
-        if data is None:
-            continue  # text messages are not used yet
-        if len(data) != audio.FRAME_BYTES:
-            bad_frames += 1
-            continue
-        frames.append(data)
-        if len(frames) % audio.FRAMES_PER_SECOND == 0:  # once a second
-            last_second = b"".join(frames[-audio.FRAMES_PER_SECOND:])
-            await ws.send_json({
-                "type": "stats",
-                "seconds": len(frames) / audio.FRAMES_PER_SECOND,
-                "level_db": round(audio.dbfs(last_second), 1),
-                "bad_frames": bad_frames,
-            })
+    stt = SarvamSTT()
+    try:
+        await stt.connect()
+    except Exception as e:  # bad key, network down: tell the user instead of failing silently
+        log.warning("STT connect failed: %s", e)
+        await ws.send_json({"type": "error", "message": f"Speech-to-text unavailable: {e}"})
+        await ws.close()
+        return
 
-    if frames:
-        name = f"browser-{datetime.now():%Y%m%d-%H%M%S}.wav"
-        # Writing a file blocks; run it in a thread so other calls on the event loop keep going.
-        path = await asyncio.to_thread(audio.save_wav, RECORDINGS / name, b"".join(frames))
-        log.info("saved %.1f s of audio to %s", len(frames) / audio.FRAMES_PER_SECOND, path)
+    send_lock = asyncio.Lock()
+
+    async def send_json(message: dict) -> None:
+        # Two tasks send to this socket (VAD events and transcripts); one at a time.
+        async with send_lock:
+            await ws.send_json(message)
+
+    session = VoiceSession(vad.SileroVAD(), stt, send_json)
+    # Two things happen at once for the whole call: frames come in from the browser,
+    # and transcripts come back from the STT provider. Each gets its own task.
+    forwarder = asyncio.create_task(session.forward_transcripts())
+    forwarder.add_done_callback(_log_task_failure)
+    frames: list[bytes] = []
+    try:
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            data = message.get("bytes")
+            if data is None or len(data) != audio.FRAME_BYTES:
+                continue  # never trust network input
+            frames.append(data)
+            await session.on_frame(data)
+    finally:
+        forwarder.cancel()
+        await stt.close()
+        if frames:
+            name = f"browser-{datetime.now():%Y%m%d-%H%M%S}.wav"
+            path = await asyncio.to_thread(audio.save_wav, RECORDINGS / name, b"".join(frames))
+            log.info("saved %.1f s of audio to %s", len(frames) / audio.FRAMES_PER_SECOND, path)

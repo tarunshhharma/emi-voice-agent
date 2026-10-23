@@ -10,3 +10,4 @@ docs/plan.md
 .pytest_cache/
 recordings/
 *.wav
+models/

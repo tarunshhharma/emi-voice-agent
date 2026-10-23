@@ -21,20 +21,27 @@
   dt { color: var(--muted); }
   dd { margin: 0; }
   .hint { color: var(--muted); font-size: 0.9rem; }
+  .voice { display: inline-block; padding: 0 0.5rem; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .voice.on { border-color: var(--accent); color: var(--accent); }
+  .partial { color: var(--muted); font-style: italic; min-height: 1.5em; margin: 0; }
+  ol.finals { margin: 0; padding-left: 1.4rem; display: grid; gap: 0.3rem; }
+  ol.finals small { color: var(--muted); font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <main>
-  <h1>Mic check</h1>
-  <p class="hint">Streams your microphone to the server as 16 kHz, 16-bit mono PCM in 20 ms frames. When you stop, the server saves the recording in <code>recordings/</code>.</p>
+  <h1>Live transcript</h1>
+  <p class="hint">Speak Hindi, English or Hinglish. Silero VAD on the server detects when you start and stop; Sarvam turns each turn into text. The recording is saved in <code>recordings/</code> when you stop.</p>
   <button id="toggle">Start mic</button>
   <div class="meter" aria-label="Mic level"><div id="level"></div></div>
   <dl>
     <dt>Status</dt><dd id="status">Idle</dd>
     <dt>Browser rate</dt><dd id="rate">–</dd>
     <dt>Frames sent</dt><dd id="sent">0</dd>
-    <dt>Server received</dt><dd id="server">–</dd>
+    <dt>Voice</dt><dd><span id="voice" class="voice">silent</span></dd>
   </dl>
+  <p id="partial" class="partial" aria-live="polite"></p>
+  <ol id="finals" class="finals"></ol>
 </main>
 
 <script>
@@ -91,8 +98,24 @@ async function start() {
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
-    if (m.type === "stats") {
-      $("server").textContent = `${m.seconds.toFixed(0)} s, level ${m.level_db} dBFS, bad frames ${m.bad_frames}`;
+    if (m.type === "vad") {
+      $("voice").textContent = m.speaking ? "speaking" : "silent";
+      $("voice").classList.toggle("on", m.speaking);
+    } else if (m.type === "transcript" && !m.final) {
+      $("partial").textContent = m.text;
+    } else if (m.type === "transcript" && m.final) {
+      $("partial").textContent = "";
+      if (!m.text.trim()) return;
+      const li = document.createElement("li");
+      li.textContent = m.text + " ";
+      if (m.stt_ms !== undefined) {
+        const t = document.createElement("small");
+        t.textContent = `(final ${m.stt_ms} ms after you stopped)`;
+        li.append(t);
+      }
+      $("finals").append(li);
+    } else if (m.type === "error") {
+      $("status").textContent = m.message;
     }
   };
   ws.onclose = () => { $("status").textContent = "Disconnected"; };

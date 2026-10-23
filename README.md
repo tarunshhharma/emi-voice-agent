@@ -2,7 +2,7 @@
 
 A real-time Hindi/Hinglish voice agent that calls a borrower about an upcoming or missed EMI and resolves the call into a structured outcome: promise to pay, payment link, already paid, dispute, or handover to a human. Runs on synthetic data only.
 
-> **Status: work in progress.** The text-mode agent brain works end to end: identity verification, a code-driven state machine, all six call outcomes, tool calling and compliance guardrails, with 101 tests. The voice pipeline (VAD, streaming STT/TTS, barge-in), Twilio and the dashboard come next.
+> **Status: work in progress.** The text-mode agent brain works end to end: identity verification, a code-driven state machine, all six call outcomes, tool calling and compliance guardrails, with 121 tests. On the voice side, browser mic audio flows through Silero VAD into streaming Hinglish STT with live transcripts. Spoken replies (TTS), barge-in, Twilio and the dashboard come next.
 
 ## Eval results (text mode)
 
@@ -57,4 +57,4 @@ pytest                          # run the tests
 python -m evals.simulate        # run the simulated-caller evals (uses the OpenAI API)
 ```
 
-The health check server runs with `uvicorn app.main:app --reload` at http://127.0.0.1:8000/health.
+Live transcript in the browser (needs `SARVAM_API_KEY`): run `uvicorn app.main:app --reload` and open http://localhost:8000. Silero VAD on the server detects when you start and stop speaking; Sarvam's realtime STT streams partial and final Hinglish transcripts back. The VAD model downloads automatically on first start.
