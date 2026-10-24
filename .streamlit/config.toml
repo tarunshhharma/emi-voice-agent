@@ -1,0 +1,8 @@
+# Read by `streamlit run` from the project folder.
+[server]
+# Skip the first-run "Email:" prompt, which otherwise blocks startup until answered,
+# and don't try to open a browser (open http://localhost:8501 yourself).
+headless = true
+
+[browser]
+gatherUsageStats = false

@@ -2,7 +2,7 @@
 
 A real-time Hindi/Hinglish voice agent that calls a borrower about an upcoming or missed EMI and resolves the call into a structured outcome: promise to pay, payment link, already paid, dispute, or handover to a human. Runs on synthetic data only.
 
-> **Status: work in progress.** A full spoken call works in the browser: Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in with backchannel handling, and per-stage latency logged for every turn. 183 tests. Next: a dashboard, a public demo, then a larger eval run, red-team and Twilio.
+> **Status: work in progress.** A full spoken call works in the browser: Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in with backchannel handling, per-stage latency logged for every turn, and a calls dashboard. 196 tests. Next: a public demo, then a larger eval run, red-team and Twilio.
 
 ## Eval results (text mode)
 
@@ -84,6 +84,17 @@ Pauses inside a sentence ranged from 320 to 1480 ms, so no fixed threshold works
 - **Continuations:** if the caller carries on before the agent's reply has played, that reply is rolled back and both fragments are answered as one turn. The LLM's thinking time is the grace window.
 - **Backchannels:** 300 ms of caller speech pauses the agent; the final transcript decides. "haan / hmm / ji / theek hai" resumes her where she paused; anything else is a barge-in. Sarvam's partials arrive ~1 s after speech starts, too late to decide sooner.
 
+## Dashboard
+
+`streamlit run dashboard/app.py`, then open http://localhost:8501. It reads `emi.db` and shows what a collections team would watch:
+
+- **Results:** calls, % verified, % ending with an outcome, money promised to pay, outcomes by type.
+- **Compliance:** loan data returned in calls that were never verified (checked independently of the output filter; must be 0), sentences blocked by reason, failed verifications, tools refused or deferred.
+- **Experience:** latency p50/p95 per stage, voice-to-voice and filler per turn, barge-ins and their reaction time.
+- **Calls to review**, each with a reason (dispute, hardship, already paid, callback, failed verification, guardrail block, slow turn), and a call view with the transcript and its audit log. Phone numbers and dates are masked.
+
+All numbers come from `dashboard/data.py`, which is tested; `dashboard/app.py` is only layout.
+
 ## Design decisions
 
 - **Code owns the call state; the LLM only chooses words.** Each state (verify, remind, resolve, done) allows specific tools. The model is only shown those tools, and the dispatcher refuses anything else.
@@ -97,7 +108,7 @@ Pauses inside a sentence ranged from 320 to 1480 ms, so no fixed threshold works
 
 ## Stack
 
-Python 3.11 · FastAPI · asyncio · SQLite + SQLAlchemy · OpenAI (Responses API, streaming function calling) · Silero VAD (onnxruntime) · Sarvam / Deepgram streaming STT · ElevenLabs Flash v2.5 streaming TTS · planned: Twilio Media Streams
+Python 3.11 · FastAPI · asyncio · SQLite + SQLAlchemy · OpenAI (Responses API, streaming function calling) · Silero VAD (onnxruntime) · Sarvam / Deepgram streaming STT · ElevenLabs Flash v2.5 streaming TTS · Streamlit dashboard · planned: Twilio Media Streams
 
 ## Run it (Windows, PowerShell)
 
