@@ -180,6 +180,11 @@ class VoiceSession:
             self.continuation_text = self.reply_text
         else:
             self.interrupted = True
+            if not replying and self.reply_text is not None:
+                # Most interruptions land here: TTS finished sending (and the turn was saved)
+                # seconds before the caller finished hearing it. Mark that saved turn.
+                marked = asyncio.ensure_future(asyncio.to_thread(self.agent.mark_last_reply_interrupted, self.timer.barge_in_ms))
+                marked.add_done_callback(_log_late_error)
         await self.send_json({"type": "barge_in", "continuation": continuation})
 
     async def on_final(self, text: str, timer: TurnTimer) -> None:

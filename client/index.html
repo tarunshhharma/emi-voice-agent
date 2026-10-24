@@ -94,8 +94,8 @@ let queued = [];  // chunks scheduled but not finished, so barge-in can stop the
 function play(buffer) {
   const pcm = new Int16Array(buffer, 0, buffer.byteLength >> 1);
   const audio = out.createBuffer(1, pcm.length, 16000);  // the browser resamples to its own rate
-  const out = audio.getChannelData(0);
-  for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] / 32768;
+  const samples = audio.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) samples[i] = pcm[i] / 32768;
   const src = out.createBufferSource();
   src.buffer = audio;
   src.connect(out.destination);

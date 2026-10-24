@@ -36,6 +36,9 @@ class FakeAgent:
     def save_turn(self, caller_text, agent_text, timings, interrupted):
         self.saved.append((caller_text, agent_text, timings, interrupted))
 
+    def mark_last_reply_interrupted(self, barge_in_ms):
+        self.marked = barge_in_ms
+
     def turn(self, text, on_text, interrupted=False, on_tool_start=None, replaces_previous=False):
         self.threads.add(threading.current_thread().name)
         self.interrupted_flags.append(interrupted)
@@ -421,3 +424,27 @@ def test_reply_that_arrived_while_paused_was_never_heard_so_it_is_a_continuation
     asyncio.run(session.on_final("chaudah May unnees sau nabbe", TurnTimer()))
     assert [m for m in sent if m["type"] == "barge_in"] == [{"type": "barge_in", "continuation": True}]
     assert session.continuation_text == "Meri date of birth hai" and not session.interrupted
+
+
+def test_barge_in_during_the_playback_tail_marks_the_saved_reply():
+    # Seen in real calls: TTS finished sending (and the turn was saved) before the caller cut in,
+    # so the barge-in worked but never reached the turns table.
+    session, sent = held_session(remaining_s=5)
+    session.reply_text = "haan"  # a reply exists; its task is long done
+    session.timer.first_audio = session.paused_at - 1  # and it was playing before the pause
+
+    async def run():
+        await session.on_final("Ruko, amount dobara batao.", TurnTimer())
+        await asyncio.sleep(0.1)  # the row update runs in a thread
+    asyncio.run(run())
+    assert session.agent.marked == session.hold_ms and session.interrupted
+
+
+def test_call_agent_marks_its_latest_reply_as_interrupted(session):
+    from app.db.models import Turn
+    agent = CallAgent(session, FakeClient([]), loan_id=1, allow_off_hours=True)
+    agent.save_turn(None, "Namaste...", {}, interrupted=False)
+    agent.save_turn("haan", "Aapki EMI...", {"voice_to_voice_ms": 3000}, interrupted=False)
+    agent.mark_last_reply_interrupted(320)
+    rows = session.query(Turn).filter_by(call_id=agent.call.id, speaker="agent").order_by(Turn.id).all()
+    assert [(r.interrupted, r.barge_in_ms) for r in rows] == [(False, None), (True, 320)]

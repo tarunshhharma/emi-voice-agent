@@ -6,6 +6,7 @@ each method in a worker thread with asyncio.to_thread. The same run_turn as text
 import logging
 import threading
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agent.guardrails import check_call_allowed
@@ -82,6 +83,17 @@ class CallAgent:
                 barge_in_ms=timings.get("barge_in_ms"), filler_ms=timings.get("filler_ms"),
             ))
             self.session.commit()
+
+    def mark_last_reply_interrupted(self, barge_in_ms: int | None) -> None:
+        """Barge-in during the playback tail: the reply's row was saved when it finished
+        sending, seconds before the caller cut in, so update that row."""
+        with self._lock:
+            turn = self.session.scalars(
+                select(Turn).where(Turn.call_id == self.call.id, Turn.speaker == "agent").order_by(Turn.id.desc())
+            ).first()
+            if turn is not None:
+                turn.interrupted, turn.barge_in_ms = True, barge_in_ms
+                self.session.commit()
 
     def close(self) -> None:
         """The caller hung up (or the call ended): record the end time and release the DB."""

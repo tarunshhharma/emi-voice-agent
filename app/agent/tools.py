@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -42,8 +43,26 @@ def _parse_date(text: str) -> date | None:
         return None
 
 
-def _normalise_name(name: str) -> str:
-    return " ".join(name.lower().split())
+# STT writes Indian names in Roman script inconsistently ("Kala" for "Kalla", "Sarma" for
+# "Sharma"), so names are compared on a rough phonetic key, and a near miss still counts.
+# The DOB or last-4 digits must still match exactly: that factor stops impersonation; the
+# name only confirms we have the right person. 0.75 was set on real calls: Sarvam heard
+# "Chaman Kalla" as "Saman kalam" (0.82); clearly different names score ~0.5-0.6.
+NAME_SIMILARITY = 0.75
+_SPELLING_VARIANTS = [("aa", "a"), ("ee", "i"), ("oo", "u"), ("sh", "s"), ("ph", "f"), ("w", "v")]
+
+
+def _name_key(name: str) -> str:
+    key = re.sub(r"[^a-z ]", "", name.lower())
+    for variant, plain in _SPELLING_VARIANTS:
+        key = key.replace(variant, plain)
+    key = re.sub(r"(.)\1+", r"\1", key)  # double letters: "kalla" -> "kala"
+    return " ".join(key.split())
+
+
+def _names_match(said: str, stored: str) -> bool:
+    a, b = _name_key(said), _name_key(stored)
+    return bool(a) and (a == b or SequenceMatcher(None, a, b).ratio() >= NAME_SIMILARITY)
 
 
 def _failed_verifications(session: Session, call_id: int) -> int:
@@ -70,7 +89,7 @@ def verify_identity(session: Session, call_id: int, name: str, dob_or_last4: str
     else:
         digits = re.sub(r"\D", "", dob_or_last4)
         factor_ok = len(digits) == 4 and borrower.phone.endswith(digits)
-    name_ok = _normalise_name(name) == _normalise_name(borrower.name)
+    name_ok = _names_match(name, borrower.name)
 
     if name_ok and factor_ok:
         call.verified = True

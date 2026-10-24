@@ -179,3 +179,18 @@ def test_repeated_safe_lines_are_not_spoken_twice(session):
     heard = []
     run_turn(client, session, call.id, [], on_text=heard.append)
     assert [h.strip() for h in heard] == [VERIFY_LINE]
+
+
+def test_tool_call_json_and_foreign_script_are_never_spoken():
+    # Seen live: the model wrote tool-call JSON as text, followed by Gujarati letters.
+    from app.agent.guardrails import looks_malformed
+    junk = '{"name":"Chaman Lal","dob_or_last4":""} \nછી\n**Tool invocation failed: '
+    assert looks_malformed(junk)
+    assert looks_malformed('{"name":"Aryan Maharaj","dob_or_last4":""}')
+    assert looks_malformed("છી")  # Gujarati: not something this voice speaks
+    for fine in ["Aapki EMI pachchees hazaar rupaye hai — 25 October tak.",
+                 "हाँ जी, मैं ठीक हूँ।",
+                 "Ji, ₹25,000 due hai (pre-due).", "Kya aap “haan” keh rahe hain?"]:
+        assert not looks_malformed(fine), fine
+    result = check_reply(junk, verified=True, loan=None)
+    assert not result.allowed and result.text == "" and result.reason == "malformed_output"

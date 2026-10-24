@@ -98,8 +98,21 @@ def _discloses_loan(text: str, loan) -> bool:
     return any(re.search(rf"(?<!\d){n}(?!\d)", plain) for n in _loan_numbers(loan))
 
 
+# Model output that isn't speech: tool-call JSON, markup, or a script the voice can't speak.
+# Seen live: Priya said '{"name":"Chaman Lal","dob_or_last4":""}', then two Gujarati letters and '**Tool invocation failed'.
+_NOT_SPEECH = re.compile(r'[{}\[\]<>|`\\]|\*\*|":|dob_or_last4|function_call|tool invocation', re.IGNORECASE)
+_SPEAKABLE = re.compile("^[\x20-\x7E\u00A0\u0900-\u097F\u2010-\u2027\u20B9]*$")  # Roman, Devanagari, quotes, dashes, rupee
+
+
+def looks_malformed(text: str) -> bool:
+    return bool(_NOT_SPEECH.search(text)) or not _SPEAKABLE.match(text)
+
+
 def check_reply(text: str, verified: bool, loan) -> GuardResult:
-    """Check one piece of an agent reply. Returns a safe replacement if it must not be said."""
+    """Check one piece of an agent reply. Returns a safe replacement if it must not be said
+    (an empty replacement means: say nothing)."""
+    if looks_malformed(text):
+        return GuardResult(False, "", "malformed_output")
     for reason, pattern in BLOCKED_PATTERNS.items():
         if pattern.search(text):
             return GuardResult(False, POLITE_LINE, reason)

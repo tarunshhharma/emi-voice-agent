@@ -232,3 +232,26 @@ def test_end_call_for_wrong_number(session, call):
 def test_end_call_rejects_unknown_reason(session, call):
     assert end_call(session, call.id, "bored")["error"] == "invalid_reason"
     assert call.ended_at is None
+
+
+def test_stt_spelling_variants_of_the_name_still_verify(session, call):
+    # Seen live: Sarvam wrote "Chaman Kala" for "Chaman Kalla", and the right DOB failed.
+    for said in ["Rahul Sarma", "Raahul Sharmaa", "rahul  sharma"]:
+        assert verify_identity(session, call.id, said, "3210")["verified"] is True, said
+        call.verified = False
+
+
+def test_a_close_name_alone_never_verifies(session, call):
+    # The tolerant name match only works with the exact second factor.
+    assert verify_identity(session, call.id, "Rahul Sarma", "1111")["verified"] is False
+    assert verify_identity(session, call.id, "Amit Verma", "3210")["verified"] is False
+
+
+def test_name_threshold_boundary_from_real_calls():
+    # Set on real calls: STT manglings of the right name pass, clearly different names don't.
+    from app.agent.tools import _names_match
+    assert _names_match("Saman kalam", "Chaman Kalla")      # Sarvam, real call
+    assert _names_match("R.N. Maharaj", "Aryan Maharaj")    # Sarvam, real call
+    assert not _names_match("Suresh Kalla", "Chaman Kalla")
+    assert not _names_match("Chaman Singh", "Chaman Kalla")
+    assert not _names_match("Amit Verma", "Rahul Sharma")

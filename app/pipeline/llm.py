@@ -150,6 +150,8 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
             tools.log_event(
                 session, call_id, "guardrail_block", {"reason": result.reason}, {"blocked": text}
             )
+        if not result.text:
+            return  # not speech at all (e.g. tool-call JSON): drop it rather than say a stock line
         if spoken and spoken[-1] == result.text:
             return  # two blocked sentences in a row would repeat the same safe line
         spoken.append(result.text)

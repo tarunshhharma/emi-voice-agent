@@ -156,3 +156,14 @@ def test_no_tool_announcement_after_the_agent_already_spoke(session):
     announced = []
     run_turn(client, session, call.id, [], on_text=lambda d: None, on_tool_start=announced.append)
     assert announced == []  # she already said something; a filler on top would double up
+
+
+def test_tool_call_json_written_as_text_is_dropped_and_logged(session):
+    from app.db.models import Event
+    client = FakeClient([text_response('{"name":"Rahul Sharma","dob_or_last4":""} Kripya apni DOB bataiye. ')])
+    call = start_call(session, 1)
+    heard = []
+    run_turn(client, session, call.id, [], on_text=heard.append)
+    assert heard == []  # the JSON "sentence" is dropped (it swallowed the rest of this line)
+    block = session.query(Event).filter_by(call_id=call.id, tool_name="guardrail_block").one()
+    assert json.loads(block.args_json) == {"reason": "malformed_output"}
