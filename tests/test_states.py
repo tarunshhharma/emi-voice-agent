@@ -80,6 +80,7 @@ def test_second_outcome_is_refused_once_one_is_recorded(session):
 def test_two_failed_verifications_end_the_call(session):
     call = start_call(session, 1)
     bad = json.dumps({"name": "Rahul Sharma", "dob_or_last4": "0000"})
+    run_tool(session, call.id, "verify_identity", bad)  # first mismatch: read back
     run_tool(session, call.id, "verify_identity", bad)
     run_tool(session, call.id, "verify_identity", bad)
     assert get_state(call) == State.ENDED
@@ -92,7 +93,8 @@ def test_model_only_sees_tools_for_the_current_state(session):
         tool_response("get_loan_summary", {}),
         text_response("Aapki EMI saadhe teen hazaar hai."),
     ])
-    run_turn(client, session, call.id, [], on_text=lambda d: None)
+    said = [{"role": "user", "content": "Rahul Sharma, last four 3 2 1 0"}]  # verify needs the caller's digits
+    run_turn(client, session, call.id, said, on_text=lambda d: None)
 
     offered = [{t["name"] for t in r["tools"]} for r in client.requests]
     expected = [ALLOWED_TOOLS[State.VERIFY], ALLOWED_TOOLS[State.REMIND], ALLOWED_TOOLS[State.RESOLVE]]
@@ -109,7 +111,8 @@ def test_call_closes_after_the_goodbye(session):
         tool_response("record_promise_to_pay", json.loads(ptp_args())),
         text_response("Dhanyavaad, namaste."),
     ])
-    run_turn(client, session, call.id, [], on_text=lambda d: None)
+    said = [{"role": "user", "content": "Rahul Sharma, last four 3 2 1 0"}]
+    run_turn(client, session, call.id, said, on_text=lambda d: None)
 
     assert call.ended_at is not None
     assert "tools" not in client.requests[-1]  # nothing left to call once an outcome exists

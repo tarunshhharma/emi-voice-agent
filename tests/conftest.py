@@ -42,6 +42,6 @@ def session():
 def no_cached_filler():
     """The voice session caches its filler audio per process; start every test without it."""
     from app.pipeline import session as session_module
-    session_module._filler_pcm = None
+    session_module._filler_pcm.clear()
     yield
-    session_module._filler_pcm = None
+    session_module._filler_pcm.clear()

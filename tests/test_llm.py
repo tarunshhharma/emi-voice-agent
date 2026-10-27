@@ -167,3 +167,29 @@ def test_tool_call_json_written_as_text_is_dropped_and_logged(session):
     assert heard == []  # the JSON "sentence" is dropped (it swallowed the rest of this line)
     block = session.query(Event).filter_by(call_id=call.id, tool_name="guardrail_block").one()
     assert json.loads(block.args_json) == {"reason": "malformed_output"}
+
+
+def test_verify_with_digits_the_caller_never_said_is_deferred(session):
+    from app.agent.tools import _failed_verifications
+    from app.db.models import Event
+    client = FakeClient([
+        tool_response("verify_identity", {"name": "Rahul Sharma", "dob_or_last4": "3210"}),  # invented
+        text_response("Kripya apni date of birth bataiye. "),
+    ])
+    call = start_call(session, 1)
+    messages = [{"role": "user", "content": "Haan ji, main Rahul Sharma bol raha hoon."}]
+    run_turn(client, session, call.id, messages, on_text=lambda d: None)
+    deferred = session.query(Event).filter_by(call_id=call.id, tool_name="deferred_tool").one()
+    assert json.loads(deferred.args_json) == {"tool": "verify_identity", "reason": "not_said_by_caller"}
+    assert _failed_verifications(session, call.id) == 0 and call.verified is False
+    assert not session.query(Event).filter_by(call_id=call.id, tool_name="verify_read_back").count()
+
+
+def test_every_request_carries_the_borrowers_language_preference(session):
+    from app.db.models import Loan
+    session.get(Loan, 1).borrower.preferred_language = "en"
+    session.commit()
+    client = FakeClient([text_response("Could you share your date of birth? ")])
+    call = start_call(session, 1)
+    run_turn(client, session, call.id, [], on_text=lambda d: None)
+    assert "prefers English. Speak English only" in client.requests[0]["instructions"]

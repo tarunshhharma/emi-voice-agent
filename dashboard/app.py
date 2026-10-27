@@ -16,8 +16,8 @@ st.set_page_config(page_title="EMI Voice Agent · Calls", layout="wide")
 st.title("EMI Voice Agent · Calls")
 
 with st.sidebar:
-    channels = st.multiselect("Calls from", ["browser", "sim", "text"], default=["browser"],
-                              help="browser = spoken calls · sim = simulated callers (evals) · text = terminal chat")
+    channels = st.multiselect("Calls from", ["browser", "sim", "redteam", "text"], default=["browser"],
+                              help="browser = spoken calls · sim = simulated callers (evals) · redteam = scripted attacks · text = terminal chat")
     st.button("Refresh")  # any click re-runs the page against the current database
     st.caption("Synthetic data only. Phone numbers and dates are masked in transcripts.")
 if not channels:

@@ -10,12 +10,13 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse
 from openai import OpenAI
 
+from app import demo_gate
 from app.db.models import SessionLocal
 from app.pipeline import audio, vad
 from app.pipeline.call import CallAgent, CallBlocked
 from app.pipeline.session import VoiceSession
 from app.pipeline.stt import make_stt
-from app.pipeline.tts.elevenlabs import ElevenLabsTTS
+from app.pipeline.tts import make_tts
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -60,6 +61,13 @@ async def browser_audio(ws: WebSocket):
     ?loan=<id> picks the borrower (default 1). The mic audio is also saved, for test clips."""
     await ws.accept()
     db = SessionLocal()
+    # A public demo link: refuse before anything is created or any credit is spent.
+    if why_not := await asyncio.to_thread(demo_gate.check, db, ws.query_params.get("code")):
+        log.info("demo call refused: %s", why_not)
+        await ws.send_json({"type": "error", "message": why_not})
+        await ws.close()
+        db.close()
+        return
     try:
         # Opening the call reads and writes the DB, so it runs in a thread like every agent turn.
         agent = await asyncio.to_thread(
@@ -76,6 +84,9 @@ async def browser_audio(ws: WebSocket):
     # caller's first turn doesn't pay for it. A cheap request; its result is unused.
     warm = asyncio.create_task(asyncio.to_thread(ws.app.state.openai.models.list), name="warm-openai")
     warm.add_done_callback(_log_task_failure)
+    if agent.off_hours_bypassed:  # say so openly: the guardrail exists, this demo skips it
+        await ws.send_json({"type": "notice", "text": "Demo mode: the 8 am–7 pm IST calling-hours rule is bypassed "
+                                                     "so you can try it at any time."})
     b = agent.borrower
     # Synthetic data, shown only in the browser so you know what to say (never logged).
     await ws.send_json({"type": "dev", "text": f"{b.name}, DOB {b.dob:%d-%m-%Y}, phone ends {b.phone[-4:]}"})
@@ -100,7 +111,7 @@ async def browser_audio(ws: WebSocket):
         async with send_lock:
             await ws.send_bytes(pcm)
 
-    session = VoiceSession(vad.SileroVAD(), stt, send_json, tts=ElevenLabsTTS(), send_audio=send_audio, agent=agent)
+    session = VoiceSession(vad.SileroVAD(), stt, send_json, tts=make_tts(), send_audio=send_audio, agent=agent)
     # Things happen at once for the whole call: frames come in from the browser,
     # transcripts come back from STT, and the agent speaks. Each gets its own task.
     forwarder = asyncio.create_task(session.forward_transcripts(), name="transcript")

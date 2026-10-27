@@ -1,3 +1,4 @@
+import os
 from datetime import date, datetime, timezone
 
 from sqlalchemy import ForeignKey, Text, create_engine
@@ -9,7 +10,8 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
-engine = create_engine("sqlite:///emi.db")
+# DATABASE_URL lets a container keep the DB on a mounted volume (or point at Postgres later).
+engine = create_engine(os.getenv("DATABASE_URL") or "sqlite:///emi.db")
 SessionLocal = sessionmaker(engine)
 
 
@@ -78,6 +80,8 @@ class Turn(Base):
     filler_ms: Mapped[int | None]  # caller stopped -> filler line, on turns that call a tool first
     barge_in_ms: Mapped[int | None]  # caller spoke over the agent -> stop sent
     interrupted: Mapped[bool] = mapped_column(default=False)
+    # When this line was said. Lets a reader put tool calls (events.ts) in order with the speech.
+    ts: Mapped[datetime | None] = mapped_column(default=utcnow)
 
 
 class Outcome(Base):

@@ -13,6 +13,7 @@ from app.pipeline.llm import run_turn
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")  # Priya writes Devanagari; the Windows console default can't print it
     logging.basicConfig(level=logging.WARNING, format="\n[log] %(message)s")
     ids = [a for a in sys.argv[1:] if not a.startswith("--")]
     loan_id = int(ids[0]) if ids else 1
@@ -35,7 +36,7 @@ def main() -> None:
             return
 
         call = start_call(session, loan_id, channel="text")
-        first_line = opening(borrower.name)
+        first_line = opening(borrower.name, borrower.preferred_language)
         messages = [{"role": "assistant", "content": first_line}]
         print(f"\nPriya: {first_line}")
 

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from app.agent import guardrails, tools
-from app.agent.prompts import state_instructions, system_prompt
+from app.agent.prompts import language_instruction, state_instructions, system_prompt
 from app.agent.states import ALLOWED_TOOLS, State, get_state, next_state
 from app.db.models import Call, Loan, utcnow
 
@@ -128,6 +128,16 @@ def run_tool(session: Session, call_id: int, name: str, arguments: str) -> dict:
     return result
 
 
+def _factor_from_caller(arguments: str, messages: list) -> bool:
+    try:
+        factor = json.loads(arguments)["dob_or_last4"]
+    except (ValueError, KeyError, TypeError):
+        return True  # malformed arguments: let run_tool reject them as bad_arguments
+    said = " ".join(m["content"] for m in messages
+                    if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str))
+    return tools.factor_was_said(factor, said)
+
+
 def run_turn(client, session: Session, call_id: int, messages: list, on_text=print, on_tool_start=None) -> str:
     """Stream one agent turn. Runs any tool calls, feeds results back, and repeats
     until the model answers in plain text. Returns what was said.
@@ -136,6 +146,7 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
     model = os.getenv("OPENAI_MODEL") or "gpt-6-luna"
     spoken = []
     tool_announced = False
+    echo: frozenset = frozenset()  # read-back words the disclosure check lets through, this turn only
     call = session.get(Call, call_id)
     loan = session.get(Loan, call.loan_id)
 
@@ -144,7 +155,7 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         text = sentence.strip()
         if not text:
             return
-        result = guardrails.check_reply(text, call.verified, loan)
+        result = guardrails.check_reply(text, call.verified, loan, echo)
         if not result.allowed:
             log.warning("blocked reply (%s): %s", result.reason, guardrails.mask_pii(text))
             tools.log_event(
@@ -163,7 +174,8 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
         state = get_state(call)
         request = {
             "model": model,
-            "instructions": f"{system_prompt(date.today())}\n\nCurrent step: {state_instructions(state)}",
+            "instructions": f"{system_prompt(date.today())}\n\n{language_instruction(loan.borrower.preferred_language)}"
+                            f"\n\nCurrent step: {state_instructions(state)}",
             "input": messages,
             "reasoning": {"effort": "none"},  # no hidden thinking time: lower time-to-first-token
             "stream": True,
@@ -220,8 +232,19 @@ def run_turn(client, session: Session, call_id: int, messages: list, on_text=pri
                     session, call_id, "deferred_tool", {"tool": tool_call.name},
                     {"ok": False, "error": "wait_for_caller_answer"},
                 )
+            elif tool_call.name == "verify_identity" and not _factor_from_caller(tool_call.arguments, messages):
+                # Seen live: the model "verified" with digits the caller never said, burning an
+                # attempt. The DOB or last 4 must appear in the caller's own words this call.
+                result = tools.log_event(
+                    session, call_id, "deferred_tool", {"tool": tool_call.name, "reason": "not_said_by_caller"},
+                    {"ok": False, "error": "caller_has_not_said_these_details"},
+                )
             else:
                 result = run_tool(session, call_id, tool_call.name, tool_call.arguments)
+            if "read_back" in result:
+                # Seen live: the disclosure check blocked Priya reading the caller's own DOB back,
+                # because before verification any month or date might be a due date.
+                echo = frozenset(re.findall(r"[a-z0-9]+", result["read_back"].lower()))
             messages.append(
                 {"type": "function_call_output", "call_id": tool_call.call_id, "output": json.dumps(result)}
             )

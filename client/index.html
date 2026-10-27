@@ -33,6 +33,8 @@
 <main>
   <h1>Live call</h1>
   <p class="hint">Priya calls the borrower below (add <code>?loan=5</code> to the URL for another). Answer in Hindi, English or Hinglish. You can interrupt her by talking over her. Use headphones, or the mic hears Priya too. Your audio is saved in <code>recordings/</code> when you end the call.</p>
+  <p id="notice" class="hint" hidden></p>
+  <label class="hint" for="code">Access code (public demo only): <input id="code" type="password" autocomplete="off" size="12"></label>
   <button id="toggle">Start call</button>
   <div class="meter" aria-label="Mic level"><div id="level"></div></div>
   <dl>
@@ -84,6 +86,7 @@ registerProcessor("pcm16-frames", Pcm16Frames);
 
 const $ = (id) => document.getElementById(id);
 let ws, stream, ctx, out, sent = 0;
+let serverError = null;  // the last error the server sent, shown after the socket closes
 // Priya's audio plays in its own AudioContext (out), separate from the mic's (ctx), so it can
 // be paused with out.suspend() while the caller speaks without stopping the microphone.
 let playAt = 0;  // when the next audio chunk should start, in out's time
@@ -136,6 +139,7 @@ function levelPercent(frameBuffer) {
 
 async function start() {
   $("status").textContent = "Connecting…";
+  serverError = null;
   // Created first, inside the click, so audio may play (autoplay rules) even if the agent
   // starts speaking while the mic permission prompt is still open.
   ctx = new AudioContext();
@@ -143,7 +147,8 @@ async function start() {
   playAt = 0;
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const loan = new URLSearchParams(location.search).get("loan") || "1";  // ?loan=5 calls another borrower
-  ws = new WebSocket(`${scheme}://${location.host}/ws/browser?loan=${encodeURIComponent(loan)}`);
+  const code = $("code").value.trim();  // only needed on the public demo
+  ws = new WebSocket(`${scheme}://${location.host}/ws/browser?loan=${encodeURIComponent(loan)}&code=${encodeURIComponent(code)}`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) return play(e.data);  // binary = agent audio
@@ -173,6 +178,9 @@ async function start() {
       const t = document.createElement("small");
       t.textContent = m.continuation ? "(you continued: answering both parts together)" : "(interrupted)";
       agentLine?.append(t);
+    } else if (m.type === "notice") {
+      $("notice").textContent = m.text;
+      $("notice").hidden = false;
     } else if (m.type === "dev") {
       $("dev").textContent = m.text;
     } else if (m.type === "ended") {
@@ -192,10 +200,12 @@ async function start() {
         li.append(t);
       }
     } else if (m.type === "error") {
+      serverError = m.message;
       $("status").textContent = m.message;
     }
   };
-  ws.onclose = () => { $("status").textContent = "Disconnected"; };
+  // Keep the server's reason on screen (e.g. "needs an access code") instead of a bare "Disconnected".
+  ws.onclose = () => { $("status").textContent = serverError ? `Call ended: ${serverError}` : "Disconnected"; };
   await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
 
   stream = await navigator.mediaDevices.getUserMedia({

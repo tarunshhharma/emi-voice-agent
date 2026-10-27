@@ -57,12 +57,24 @@ def make_loan(segment: str, borrower_id: int, today: date) -> Loan:
     )
 
 
-def seed(bind=engine) -> None:
-    """Drop and recreate all tables, then insert 200 synthetic borrowers + loans."""
+# Dates of birth count back from this fixed day, not from today. Faker's date_of_birth()
+# used today, so every DOB moved by a day each day, and it drew differently on Windows and
+# Linux, so the Docker container had different borrowers from the laptop (found 24 Oct).
+DOB_ANCHOR = date(2026, 10, 21)
+
+
+def make_dob(min_age: int = 21, max_age: int = 60) -> date:
+    return DOB_ANCHOR - timedelta(days=random.randint(min_age * 365, max_age * 365))
+
+
+def seed(bind=engine, today: date | None = None) -> None:
+    """Drop and recreate all tables, then insert 200 synthetic borrowers + loans.
+    The same borrowers on every machine and every day; only due dates follow today, so
+    "9 days overdue" stays true whenever the demo runs."""
     random.seed(42)
-    Faker.seed(42)  # same data every run, so evals are reproducible
+    Faker.seed(42)  # names and cities: the same data every run, so evals are reproducible
     fake = Faker("en_IN")
-    today = date.today()
+    today = today or date.today()
 
     Base.metadata.drop_all(bind)
     Base.metadata.create_all(bind)
@@ -74,7 +86,7 @@ def seed(bind=engine) -> None:
                     name=fake.name(),
                     # one uniform format, so "last 4 digits" checks are simple
                     phone=f"+91{random.randint(6, 9)}{random.randint(0, 999_999_999):09d}",
-                    dob=fake.date_of_birth(minimum_age=21, maximum_age=60),
+                    dob=make_dob(),
                     preferred_language=random.choices(
                         ["hinglish", "hi", "en"], weights=[60, 25, 15]
                     )[0],

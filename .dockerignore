@@ -1,0 +1,17 @@
+# Never in the image: secrets, local state, and anything large that the server doesn't need.
+.env
+.git
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.db
+recordings/
+models/
+evals/
+tests/
+docs/
+.pytest_cache/
+.cursor/
+.claude/
+.env.demo

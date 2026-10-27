@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agent.guardrails import check_call_allowed
-from app.agent.prompts import opening
+from app.agent.prompts import filler_line, opening
 from app.agent.tools import start_call
 from app.db.models import Loan, Turn, utcnow
 from app.pipeline.llm import run_turn
@@ -35,13 +35,15 @@ class CallAgent:
             raise CallBlocked(f"no loan {loan_id}")
         self.borrower = loan.borrower
         reason = check_call_allowed(self.borrower)
-        if reason == "outside_calling_hours" and allow_off_hours:
+        self.off_hours_bypassed = reason == "outside_calling_hours" and allow_off_hours
+        if self.off_hours_bypassed:
             log.warning("calling-hours check bypassed (ALLOW_OFF_HOURS)")
             reason = None
         if reason:
             raise CallBlocked(reason)
         self.call = start_call(session, loan_id, channel="browser")
-        self.first_line = opening(self.borrower.name)
+        self.first_line = opening(self.borrower.name, self.borrower.preferred_language)
+        self.filler_line = filler_line(self.borrower.preferred_language)
         self.messages = [{"role": "assistant", "content": self.first_line}]
         self._turn_start = len(self.messages)  # where the latest turn's messages begin
         # A thread can't be cancelled: if the caller hangs up mid-turn, the turn finishes in

@@ -11,26 +11,29 @@ from sqlalchemy import select
 
 from app.agent.prompts import opening
 from app.agent.tools import start_call
-from app.db.models import Event, Loan, SessionLocal, Turn
+from app.db.models import Event, Loan, SessionLocal, Turn, utcnow
 from app.pipeline.llm import run_turn
 from evals.personas import PERSONAS
 
 MAX_TURNS = 8
 HANGUP = "[HANGUP]"
+HINGLISH = "Hinglish (Hindi in Roman script mixed with English)"
 
 CALLER_INSTRUCTIONS = """You are role-playing a person who has just answered a phone call from an automated EMI assistant.
-Stay in character. Reply with only what you would say out loud: 1 or 2 short sentences, in Hinglish
-(Hindi in Roman script mixed with English), as people talk on the phone. Never describe actions.
+Stay in character. Reply with only what you would say out loud: 1 or 2 short sentences, in {speaks},
+as people talk on the phone. Never describe actions.
 If the call has clearly ended, reply with exactly {hangup}.
 
 Your character: {brief}
 What you know: {facts}"""
 
 
-def pick_loan(session, segment: str, nth: int) -> Loan:
-    """The nth borrower of a segment who may be called (skips do-not-call), so runs are repeatable."""
+def pick_loan(session, segment: str, nth: int, language: str | None = None) -> Loan:
+    """The nth borrower of a segment who may be called (skips do-not-call), so runs are repeatable.
+    language: only borrowers who prefer it (e.g. "en" for an English-speaking persona)."""
     loans = session.scalars(select(Loan).where(Loan.segment == segment).order_by(Loan.id)).all()
-    return [loan for loan in loans if not loan.borrower.dnd_flag][nth]
+    return [loan for loan in loans if not loan.borrower.dnd_flag
+            and (language is None or loan.borrower.preferred_language == language)][nth]
 
 
 def caller_facts(persona: dict, loan: Loan) -> str:
@@ -46,7 +49,8 @@ def caller_facts(persona: dict, loan: Loan) -> str:
 def caller_reply(client, persona: dict, facts: str, history: list) -> str:
     response = client.responses.create(
         model=os.getenv("OPENAI_MODEL") or "gpt-6-luna",
-        instructions=CALLER_INSTRUCTIONS.format(hangup=HANGUP, brief=persona["brief"], facts=facts),
+        instructions=CALLER_INSTRUCTIONS.format(hangup=HANGUP, brief=persona["brief"], facts=facts,
+                                                speaks=persona.get("speaks", HINGLISH)),
         input=history,
         reasoning={"effort": "none"},
     )
@@ -80,12 +84,12 @@ def score(session, persona: dict, call) -> dict:
 
 
 def simulate(client, session, persona: dict, nth: int = 0, verbose: bool = True) -> dict:
-    loan = pick_loan(session, persona["segment"], nth)
+    loan = pick_loan(session, persona["segment"], nth, persona.get("language"))
     facts = caller_facts(persona, loan)
     # Calling-hours check is skipped: this is an offline simulation, not a real call.
     call = start_call(session, loan.id, channel="sim")
 
-    first_line = opening(loan.borrower.name)
+    first_line = opening(loan.borrower.name, loan.borrower.preferred_language)
     agent_messages = [{"role": "assistant", "content": first_line}]
     caller_history = [{"role": "user", "content": first_line}]  # roles are flipped for the caller
     session.add(Turn(call_id=call.id, speaker="agent", text=first_line))
@@ -96,10 +100,13 @@ def simulate(client, session, persona: dict, nth: int = 0, verbose: bool = True)
         said_by_caller = caller_reply(client, persona, facts, caller_history)
         if HANGUP in said_by_caller or not said_by_caller:
             break
-        session.add(Turn(call_id=call.id, speaker="caller", text=said_by_caller))
+        session.add(Turn(call_id=call.id, speaker="caller", text=said_by_caller, ts=utcnow()))  # before the agent acts
+        # Commit now: a pending row would be flushed inside run_turn and hold SQLite's write lock
+        # for the whole LLM request, so parallel eval calls failed with "database is locked".
+        session.commit()
         agent_messages.append({"role": "user", "content": said_by_caller})
         said_by_agent = run_turn(client, session, call.id, agent_messages, on_text=lambda d: None)
-        session.add(Turn(call_id=call.id, speaker="agent", text=said_by_agent))
+        session.add(Turn(call_id=call.id, speaker="agent", text=said_by_agent, ts=utcnow()))  # after its tools ran
         session.commit()
         if verbose:
             print(f"Caller: {said_by_caller}\nAgent:  {said_by_agent}")

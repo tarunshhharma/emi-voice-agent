@@ -65,6 +65,47 @@ def _names_match(said: str, stored: str) -> bool:
     return bool(a) and (a == b or SequenceMatcher(None, a, b).ratio() >= NAME_SIMILARITY)
 
 
+# Digits and months as callers say them, in English and Hindi (Roman script, as STT writes it).
+DIGIT_WORDS = {
+    "zero": "0", "oh": "0", "shunya": "0", "one": "1", "ek": "1", "two": "2", "do": "2",
+    "three": "3", "teen": "3", "four": "4", "chaar": "4", "char": "4", "five": "5", "paanch": "5",
+    "panch": "5", "six": "6", "chhah": "6", "chhe": "6", "che": "6", "chah": "6", "seven": "7",
+    "saat": "7", "sat": "7", "eight": "8", "aath": "8", "aat": "8", "nine": "9", "nau": "9",
+}
+MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July", "August",
+               "September", "October", "November", "December"]
+MONTH_WORDS = {name.lower(): n for n, name in enumerate(MONTH_NAMES) if name}
+MONTH_WORDS.update({name.lower()[:3]: n for n, name in enumerate(MONTH_NAMES) if name})
+MONTH_WORDS.update({"janvari": 1, "farvari": 2, "aprail": 4, "mai": 5, "joon": 6, "jun": 6, "julai": 7,
+                    "agast": 8, "sitambar": 9, "aktubar": 10, "navambar": 11, "disambar": 12})
+
+
+def factor_was_said(dob_or_last4: str, caller_text: str) -> bool:
+    """Did the caller actually say this DOB or these last 4 digits during the call?
+    Seen live: the model called verify_identity with digits nobody had said."""
+    tokens = [DIGIT_WORDS.get(t, t) for t in re.findall(r"[a-z]+|\d+", caller_text.lower())]
+    dob = _parse_date(dob_or_last4)
+    if dob:
+        numbers = {int(t) for t in tokens if t.isdigit()}
+        month_said = dob.month in numbers or any(MONTH_WORDS.get(t) == dob.month for t in tokens)
+        return dob.year in numbers and dob.day in numbers and month_said
+    digits = re.sub(r"\D", "", dob_or_last4)
+    return len(digits) == 4 and digits in "".join(t for t in tokens if t.isdigit())
+
+
+def _spoken_detail(dob_or_last4: str) -> str:
+    dob = _parse_date(dob_or_last4)
+    if dob:
+        return f"date of birth {dob.day} {MONTH_NAMES[dob.month]} {dob.year}"
+    return "phone ke aakhri chaar digits " + " ".join(re.sub(r"\D", "", dob_or_last4))
+
+
+def _read_back_done(session: Session, call_id: int) -> bool:
+    return session.scalars(
+        select(Event).where(Event.call_id == call_id, Event.tool_name == "verify_read_back")
+    ).first() is not None
+
+
 def _failed_verifications(session: Session, call_id: int) -> int:
     events = session.scalars(
         select(Event).where(Event.call_id == call_id, Event.tool_name == "verify_identity")
@@ -94,6 +135,16 @@ def verify_identity(session: Session, call_id: int, name: str, dob_or_last4: str
     if name_ok and factor_ok:
         call.verified = True
         return log_event(session, call_id, "verify_identity", args, {"ok": True, "verified": True})
+
+    # First mismatch in a call: STT may have misheard ("21 June" as "24 June"), so read back
+    # what we understood instead of failing. Always both name and detail, so it never shows
+    # which part was wrong, and it only repeats the caller's own words. One per call: the
+    # cost is one extra guess for an impostor (three instead of two).
+    if not _read_back_done(session, call_id):
+        logged = log_event(session, call_id, "verify_read_back", args,
+                           {"ok": False, "verified": False, "error": "read_back_and_confirm"})
+        # The spoken detail goes to the model only, never into the audit log.
+        return {**logged, "read_back": f"naam {name}, {_spoken_detail(dob_or_last4)}"}
 
     failed = _failed_verifications(session, call_id) + 1
     attempts_left = MAX_VERIFY_ATTEMPTS - failed

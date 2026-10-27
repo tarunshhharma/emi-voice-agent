@@ -33,11 +33,11 @@ BACKCHANNEL_WORDS = {
 ANSWER_WINDOW_S = 1.0  # a "haan" in her last second of audio is probably the answer to her question
 HOLD_TIMEOUT_S = 3.0  # caller stopped but no final transcript came: resume anyway
 PCM_BYTES_PER_SECOND = 32_000  # 16 kHz x 2 bytes
-# Said the moment the model starts a tool call, to cover the silence of the round trip.
-# Synthesized once per server process and replayed, so it starts with no TTS wait.
-FILLER_LINE = "Ek second, main check kar rahi hoon."
+# A filler line (agent.filler_line, in the borrower's language) is said the moment the model
+# starts a tool call, to cover the silence of the round trip. Each line is synthesized once
+# per server process and replayed, so it starts with no TTS wait.
 NO_FILLER_TOOLS = {"end_call"}  # "one second, let me check" before hanging up would be odd
-_filler_pcm: bytes | None = None
+_filler_pcm: dict[str, bytes] = {}  # filler line -> its audio
 
 
 def _log_late_error(task: asyncio.Future) -> None:
@@ -265,27 +265,29 @@ class VoiceSession:
             log.warning("could not save turn: %r", e)
 
     async def prepare_filler(self) -> None:
-        global _filler_pcm
-        if _filler_pcm is not None:
+        line = self.agent.filler_line
+        if line in _filler_pcm:
             return
         try:
-            _filler_pcm = b"".join([chunk async for chunk in self.tts.stream(from_list([FILLER_LINE]))])
+            _filler_pcm[line] = b"".join([chunk async for chunk in self.tts.stream(from_list([line]))])
         except Exception as e:  # no filler is fine: the caller just waits in silence as before
             log.warning("could not prepare filler: %r", e)
 
     def start_filler(self, tool: str) -> None:
         """The model started a tool call before saying anything this turn."""
-        if tool in NO_FILLER_TOOLS or not _filler_pcm or self.said:
+        if tool in NO_FILLER_TOOLS or self.agent.filler_line not in _filler_pcm or self.said:
             return
         self.filler_task = asyncio.ensure_future(self.play_filler())
 
     async def play_filler(self) -> None:
-        self.said.append(FILLER_LINE)
-        await self.send_json({"type": "agent_text", "text": FILLER_LINE, "first": True, "filler": True})
+        line = self.agent.filler_line
+        pcm = _filler_pcm[line]
+        self.said.append(line)
+        await self.send_json({"type": "agent_text", "text": line, "first": True, "filler": True})
         self.timer.filler_audio = time.monotonic()
-        await self.send_audio(_filler_pcm)
+        await self.send_audio(pcm)
         now = time.monotonic()
-        self.playing_until = max(now, self.playing_until) + len(_filler_pcm) / PCM_BYTES_PER_SECOND
+        self.playing_until = max(now, self.playing_until) + len(pcm) / PCM_BYTES_PER_SECOND
 
     async def respond(self, text: str, interrupted: bool = False, replaces_previous: bool = False) -> bool:
         """Run one agent turn in a worker thread and speak its sentences as they arrive.

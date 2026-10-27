@@ -4,9 +4,10 @@ import threading
 
 import pytest
 
+from app.agent.prompts import filler_line
 from app.pipeline.call import CallAgent, CallBlocked
 from app.pipeline.metrics import TurnTimer
-from app.pipeline.session import FILLER_LINE, VoiceSession, from_list
+from app.pipeline.session import VoiceSession, from_list
 from tests.fakes import FakeClient, text_response, tool_response
 
 
@@ -24,6 +25,7 @@ class FakeAgent:
     """Blocking, like CallAgent: says its lines from a worker thread, one by one."""
 
     first_line = "Namaste, kya main Rahul ji se baat kar rahi hoon?"
+    filler_line = "Ek second, main check kar rahi hoon."
 
     def __init__(self, replies, end_after=None, fail_on=None):
         self.replies = replies  # caller text -> sentences to say
@@ -81,7 +83,7 @@ def test_converse_speaks_opening_then_each_turn_until_the_call_ends():
         await asyncio.wait_for(session.converse(), 5)
 
     asyncio.run(run())
-    spoken = [s.strip() for s in tts.heard if s != FILLER_LINE]  # the filler is pre-synthesized too
+    spoken = [s.strip() for s in tts.heard if s != agent.filler_line]  # the filler is pre-synthesized too
     assert spoken == [agent.first_line, "Dhanyavaad.", "Shukriya, namaste."]
     assert sent[-1] == {"type": "ended"}
 
@@ -272,7 +274,7 @@ class ToolAgent(FakeAgent):
 
 
 def run_one_turn(agent):
-    session_module._filler_pcm = b"\x00\x00" * 1600  # pretend the filler was prepared (0.1 s)
+    session_module._filler_pcm[agent.filler_line] = b"\x00\x00" * 1600  # pretend the filler was prepared (0.1 s)
     session, sent = voice_session(agent, range(0))
     session.timer = TurnTimer(caller_stopped=time.monotonic())
     asyncio.run(session.respond("Rahul Sharma, 14 May 1990"))
@@ -282,11 +284,28 @@ def run_one_turn(agent):
 
 def test_filler_plays_when_a_tool_starts_before_anything_is_said():
     session, texts = run_one_turn(ToolAgent())
-    assert texts[0]["text"] == session_module.FILLER_LINE and texts[0].get("filler")
+    assert texts[0]["text"] == ToolAgent.filler_line and texts[0].get("filler")
     assert texts[1]["text"] == "Dhanyavaad, aap verify ho gaye."
     d = session.timer.durations()
     assert d["filler_ms"] is not None and d["filler_ms"] < d["voice_to_voice_ms"]
-    assert session.said[0] == session_module.FILLER_LINE  # saved as part of what the caller heard
+    assert session.said[0] == ToolAgent.filler_line  # saved as part of what the caller heard
+
+
+def test_filler_is_in_the_borrowers_language():
+    english = ToolAgent()
+    english.filler_line = filler_line("en")
+    session, texts = run_one_turn(english)
+    assert texts[0]["text"] == "One second, let me check."
+    assert filler_line("hinglish") == "एक second, मैं check कर रही हूँ।"
+
+
+def test_call_agent_takes_the_filler_from_the_borrowers_language(session):
+    from app.db.models import Loan
+    loan = session.get(Loan, 1)
+    loan.borrower.preferred_language = "en"
+    session.commit()
+    agent = CallAgent(session, None, loan_id=1, allow_off_hours=True)
+    assert agent.filler_line == "One second, let me check."
 
 
 def test_no_filler_before_hanging_up():

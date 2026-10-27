@@ -194,3 +194,71 @@ def test_tool_call_json_and_foreign_script_are_never_spoken():
         assert not looks_malformed(fine), fine
     result = check_reply(junk, verified=True, loan=None)
     assert not result.allowed and result.text == "" and result.reason == "malformed_output"
+
+
+def test_read_back_of_the_callers_own_dob_is_not_a_disclosure(loan):
+    # Seen live: before verification the disclosure check blocked Priya reading back the DOB
+    # the caller had just given ("June" might be a due-date month).
+    sentence = "Aapne naam Aryan Maharaj, date of birth 24 June 1982 bataya, kya yeh sahi hai?"
+    echo = frozenset("naam aryan maharaj date of birth 24 june 1982".split())
+    assert not check_reply(sentence, verified=False, loan=loan).allowed  # without the read-back: blocked
+    assert check_reply(sentence, verified=False, loan=loan, echo=echo).allowed
+    # The exemption covers only the echoed words: a due date or an amount is still blocked.
+    assert not check_reply("Aapki EMI 12 October ko due thi.", verified=False, loan=loan, echo=echo).allowed
+    assert not check_reply("Aapke 3500 baaki hain, 24 June 1982 wale.", verified=False, loan=loan, echo=echo).allowed
+
+
+# --- Devanagari: Priya writes Hindi in native script for the Indian voice ---
+
+@pytest.mark.parametrize("reply, reason", [
+    ("अगर आप नहीं भरेंगे तो पुलिस आएगी।", "threat"),
+    ("हम कोर्ट में केस करेंगे।", "threat"),
+    ("आपको गिरफ़्तार किया जा सकता है।", "threat"),  # with nukta
+    ("आपको शर्म आनी चाहिए।", "shaming"),
+    ("आप तो डिफॉल्टर हैं।", "shaming"),
+    ("हम आपके परिवार को बता देंगे।", "third_party_contact"),
+    ("आपके घरवालों से बात करनी पड़ेगी।", "third_party_contact"),  # suffixed form
+    ("हम आपके पड़ोसी से पूछ लेंगे।", "third_party_contact"),  # ड़ with nukta
+])
+def test_devanagari_threats_shaming_and_third_parties_are_blocked(reply, reason, loan):
+    result = check_reply(reply, verified=True, loan=loan)
+    assert not result.allowed and result.reason == reason
+
+
+@pytest.mark.parametrize("reply", [
+    "आपकी EMI पच्चीस हज़ार रुपये है।",
+    "आपकी किस्त पच्चीस अक्टूबर को ड्यू है।",
+    "आपका लोन अभी बाकी है।",
+    "आपके तीन हजार पाँच सौ बाकी हैं।",  # no nukta
+])
+def test_devanagari_loan_details_are_blocked_before_verification(reply, loan):
+    result = check_reply(reply, verified=False, loan=loan)
+    assert not result.allowed and result.reason == "loan_detail_before_verification"
+
+
+@pytest.mark.parametrize("reply", [
+    "नमस्ते जी, कृपया अपना पूरा नाम और date of birth बताइए।",
+    "ऐसा कुछ नहीं होगा जी, मैं सिर्फ़ आपकी मदद के लिए call कर रही हूँ।",
+    "समझ सकती हूँ जी, कोई बात नहीं।",
+])
+def test_normal_devanagari_replies_pass_before_verification(reply, loan):
+    assert check_reply(reply, verified=False, loan=loan).allowed
+
+
+def test_devanagari_amounts_are_fine_once_verified(loan):
+    assert check_reply("आपकी EMI तीन हज़ार पाँच सौ रुपये है, जो बारह अक्टूबर को ड्यू थी।", verified=True, loan=loan).allowed
+
+
+def test_devanagari_digits_are_read_as_digits(loan):
+    # ३५०० is 3500, the real EMI: blocked before verification like "3500".
+    assert not check_reply("आपकी राशि ३५०० है।", verified=False, loan=loan).allowed
+
+
+def test_opening_is_in_the_borrowers_language_and_always_discloses(loan):
+    from app.agent.prompts import opening
+    english = opening("Aryan Maharaj", "en")
+    assert english.startswith("Hello, this is Priya") and "automated call" in english and "recorded" in english
+    hindi = opening("Aryan Maharaj", "hinglish")
+    assert "automated call" in hindi and "record" in hindi and "प्रिया" in hindi
+    for line in (english, hindi):  # the opening is spoken before verification: nothing about the loan
+        assert check_reply(line, verified=False, loan=loan).allowed

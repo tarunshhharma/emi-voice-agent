@@ -1,0 +1,25 @@
+# Local run of the deployable image: the voice server and the dashboard, sharing one database.
+# Usage: docker compose up --build   then   http://localhost:8000  and  http://localhost:8501
+services:
+  voice:
+    build: .
+    env_file:               # read at run time; never copied into the image
+      - .env                # API keys
+      - path: .env.demo     # public-demo settings: access code, daily cap, calling-hours bypass
+        required: false
+    environment:
+      DATABASE_URL: sqlite:////data/emi.db
+    ports: ["8000:8000"]
+    volumes: [data:/data]
+
+  dashboard:
+    build: .
+    environment:
+      DATABASE_URL: sqlite:////data/emi.db
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    ports: ["8501:8501"]
+    volumes: [data:/data]
+    depends_on: [voice]     # the voice container seeds the database first
+
+volumes:
+  data:

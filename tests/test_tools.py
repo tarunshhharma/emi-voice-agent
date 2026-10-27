@@ -49,8 +49,28 @@ def test_name_ignores_case_and_extra_spaces(session, call):
     assert verify_identity(session, call.id, "  rahul   SHARMA ", "3210")["verified"] is True
 
 
-def test_wrong_factor_fails_without_ending_call(session, call):
+def test_first_mismatch_is_read_back_not_failed(session, call):
+    # STT can mishear a digit; the first mismatch reads the details back instead of failing.
     result = verify_identity(session, call.id, "Rahul Sharma", "1111")
+    assert result["error"] == "read_back_and_confirm" and result["verified"] is False
+    assert result["read_back"] == "naam Rahul Sharma, phone ke aakhri chaar digits 1 1 1 1"
+    from app.agent.tools import _failed_verifications
+    assert _failed_verifications(session, call.id) == 0 and call.ended_at is None
+
+
+def test_read_back_speaks_a_dob_in_words():
+    from app.agent.tools import _spoken_detail
+    assert _spoken_detail("21-06-1982") == "date of birth 21 June 1982"
+
+
+def test_a_corrected_answer_after_the_read_back_verifies(session, call):
+    verify_identity(session, call.id, "Rahul Sharma", "1111")  # misheard: read back
+    assert verify_identity(session, call.id, "Rahul Sharma", "3210")["verified"] is True
+
+
+def test_wrong_factor_fails_without_ending_call(session, call):
+    verify_identity(session, call.id, "Rahul Sharma", "1111")  # read back
+    result = verify_identity(session, call.id, "Rahul Sharma", "1111")  # caller confirmed it
     assert result == {"ok": False, "verified": False, "attempts_left": 1}
     assert call.verified is False and call.ended_at is None
 
@@ -60,8 +80,9 @@ def test_wrong_name_fails(session, call):
 
 
 def test_two_failures_end_the_call(session, call):
-    verify_identity(session, call.id, "Rahul Sharma", "1111")
-    result = verify_identity(session, call.id, "Rahul Sharma", "2222")
+    verify_identity(session, call.id, "Rahul Sharma", "1111")  # read back (one per call)
+    verify_identity(session, call.id, "Rahul Sharma", "1111")  # failure 1
+    result = verify_identity(session, call.id, "Rahul Sharma", "2222")  # failure 2
     assert result["call_ended"] is True
     assert call.ended_at is not None and call.outcome == "verify_failed"
     # Even the correct answer is refused once the call has ended.
@@ -69,8 +90,37 @@ def test_two_failures_end_the_call(session, call):
 
 
 def test_failure_does_not_leak_which_part_was_wrong(session, call):
+    # The read-back always repeats both name and detail, whichever was wrong...
+    wrong_factor = verify_identity(session, call.id, "Rahul Sharma", "1111")
+    assert wrong_factor["read_back"].startswith("naam Rahul Sharma, phone")
+    # ...and a real failure says nothing about which part failed.
     result = verify_identity(session, call.id, "Rahul Sharma", "1111")
     assert set(result) == {"ok", "verified", "attempts_left"}
+
+
+def test_wrong_name_is_read_back_the_same_way(session, call):
+    result = verify_identity(session, call.id, "Amit Verma", "3210")
+    assert result["read_back"] == "naam Amit Verma, phone ke aakhri chaar digits 3 2 1 0"
+
+
+def test_read_back_never_stores_the_spoken_digits(session, call):
+    from app.db.models import Event
+    result = verify_identity(session, call.id, "Rahul Sharma", "01-01-1990")  # wrong DOB: read back
+    assert result["read_back"] == "naam Rahul Sharma, date of birth 1 January 1990"  # the model hears it...
+    for e in session.query(Event).filter_by(call_id=call.id):  # ...the audit log never stores it
+        assert "01-01-1990" not in e.result_json and "1 January 1990" not in e.result_json
+
+
+def test_factor_must_have_been_said_by_the_caller():
+    from app.agent.tools import factor_was_said
+    assert factor_was_said("21-06-1982", "Mera naam Aryan Maharaj, date of birth 21 June 1982.")
+    assert factor_was_said("14-10-1969", "DOB chaudah... I mean 14 October 1969")
+    assert factor_was_said("21-06-1982", "21st joon 1982")  # Hindi month spelling, ordinal
+    assert factor_was_said("5092", "last four digits paanch zero nau do")  # digits as words
+    assert factor_was_said("5092", "5 0 9 2")
+    assert not factor_was_said("21-06-1982", "Haan ji, main Aryan Maharaj bol raha hoon.")
+    assert not factor_was_said("21-06-1982", "date of birth 24 June 1982")
+    assert not factor_was_said("1234", "Mera naam Rahul Sharma")
 
 
 def test_audit_log_does_not_store_raw_dob_or_digits(session, call):

@@ -12,3 +12,4 @@ recordings/
 *.wav
 models/
 evals/results/
+.env.demo
