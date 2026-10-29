@@ -23,6 +23,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS = ROOT / "recordings"
+# Spoken calls running right now. A plain int is safe: one process, one event loop,
+# and it only changes between awaits.
+active_calls = 0
 
 
 @asynccontextmanager
@@ -59,15 +62,27 @@ def _log_task_failure(task: asyncio.Task) -> None:
 async def browser_audio(ws: WebSocket):
     """A full spoken call: browser mic -> VAD -> STT -> agent -> TTS -> binary PCM back.
     ?loan=<id> picks the borrower (default 1). The mic audio is also saved, for test clips."""
+    global active_calls
     await ws.accept()
     db = SessionLocal()
     # A public demo link: refuse before anything is created or any credit is spent.
-    if why_not := await asyncio.to_thread(demo_gate.check, db, ws.query_params.get("code")):
+    why_not = await asyncio.to_thread(demo_gate.check, db, ws.query_params.get("code"))
+    # Checked after that await, with no await before the count goes up: two calls can't both slip in.
+    why_not = why_not or demo_gate.busy(active_calls, demo_gate.env_int("MAX_ACTIVE_CALLS"))
+    if why_not:
         log.info("demo call refused: %s", why_not)
         await ws.send_json({"type": "error", "message": why_not})
         await ws.close()
         db.close()
         return
+    active_calls += 1
+    try:
+        await _run_call(ws, db)
+    finally:  # every way out of a call, including errors, frees its slot
+        active_calls -= 1
+
+
+async def _run_call(ws: WebSocket, db) -> None:
     try:
         # Opening the call reads and writes the DB, so it runs in a thread like every agent turn.
         agent = await asyncio.to_thread(
@@ -121,15 +136,22 @@ async def browser_audio(ws: WebSocket):
     conversation.add_done_callback(_log_task_failure)
     frames: list[bytes] = []
     try:
-        while True:
-            message = await ws.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-            data = message.get("bytes")
-            if data is None or len(data) != audio.FRAME_BYTES:
-                continue  # never trust network input
-            frames.append(data)
-            await session.on_frame(data)
+        # STT, LLM and TTS all cost money while the socket is open, so a public demo bounds
+        # every call. timeout(None), the default when MAX_CALL_SECONDS isn't set, never fires.
+        async with asyncio.timeout(demo_gate.env_int("MAX_CALL_SECONDS")):
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                data = message.get("bytes")
+                if data is None or len(data) != audio.FRAME_BYTES:
+                    continue  # never trust network input
+                frames.append(data)
+                await session.on_frame(data)
+    except TimeoutError:
+        log.info("call ended at the demo time limit")
+        await send_json({"type": "error", "message": "This demo call reached its time limit. Thanks for trying it!"})
+        await ws.close()
     finally:
         forwarder.cancel()
         conversation.cancel()
