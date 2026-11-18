@@ -2,7 +2,7 @@
 
 A real-time Hindi/Hinglish voice agent that calls a borrower about an upcoming or missed EMI and resolves the call into a structured outcome: promise to pay, payment link, already paid, dispute, or handover to a human. Runs on synthetic data only.
 
-> **Status: work in progress.** A full spoken call works in the browser: Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in with backchannel handling, per-stage latency logged for every turn, and a calls dashboard. 196 tests. Next: a public demo, then a larger eval run, red-team and Twilio.
+**What's built:** a full spoken call in the browser, with Silero VAD, streaming Hinglish STT, the agent brain (code-driven state machine, tool calling, compliance guardrails, all six outcomes), streaming TTS, barge-in with backchannel handling, per-stage latency logged for every turn, and a calls dashboard. It is measured by a 36-call simulated-caller eval (97% task success, 0 disclosures before verification), a 10-attack red-team suite (0 attacks got through), and 196 tests. See [Future work](#future-work) for what comes next.
 
 ## Eval results (text mode)
 
@@ -147,3 +147,9 @@ python -m evals.simulate        # run the simulated-caller evals (uses the OpenA
 ```
 
 Spoken call in the browser (needs `OPENAI_API_KEY`, `SARVAM_API_KEY`, `ELEVENLABS_API_KEY`): run `uvicorn app.main:app --reload`, open http://localhost:8000 and use headphones. Priya calls borrower #1 (add `?loan=5` for another); the page shows the synthetic details to answer with. You can interrupt her by talking over her. Outside 8 am–7 pm IST the calling-hours guardrail blocks the call; set `ALLOW_OFF_HOURS=1` in `.env` for testing. The VAD model downloads automatically on first start. `python -m app.pipeline.metrics` prints the latency table.
+
+## Future work
+
+- **Phone calls:** connect the same `CallSession` to Twilio Media Streams (8 kHz μ-law in and out).
+- **Latency:** bring voice-to-voice p50 under 1.5 s. The verify turn's three sequential LLM requests are the main cost.
+- **Callbacks before verification:** let a busy caller book a callback before verifying, since a callback reveals nothing. This was the one miss in the final eval run.

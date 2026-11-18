@@ -15,6 +15,15 @@ Voice AI interview prep. The user must be able to explain every design choice.
 - Keep code simple and readable. No extra abstractions until needed.
 - Do one task at a time, then stop and wait for the user to confirm it runs.
 - After non-trivial code, explain in 3-5 bullets what it does and why, and what an interviewer might ask.
+- After every task, append a section to `C:\Users\Tarun\Downloads\emi-voice-agent-notes.md` (outside the project). Append only, never overwrite earlier sections. Create the file if missing, and confirm the path after writing. Heading: `## Day <N> · Task <N>: <short title> (<date>)`, then these subsections in order:
+  - What we built
+  - Why we did it this way (decision and rejected alternative)
+  - Concepts explained (2-4 lines each)
+  - Interview questions this answers (2-3 line answers in the user's voice)
+  - Bugs and fixes ("None" if nothing broke)
+  - a `> ✍️ **HANDWRITE THESE**` quote block with 3-5 points, each under 20 words
+
+  Keep it concise, with no code dumps (reference file names).
 - Do not overwrite `docs/plan.md`, `docs/design-notes.md` or anything in `.cursor/`.
 
 ## Conventions from the plan

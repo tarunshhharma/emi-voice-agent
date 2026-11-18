@@ -7,3 +7,4 @@ alwaysApply: true
 - Environment: Windows (venv or WSL2).
 - Goal: voice AI interview prep. Explain non-trivial code in short bullets and note likely interview questions.
 - Keep code simple. Do one task at a time and stop for confirmation.
+- After every task, append a learning-notes section to C:\Users\Tarun\Downloads\emi-voice-agent-notes.md using the format defined in the first notes prompt (What we built, Why, Concepts, Interview questions, Bugs, HANDWRITE THESE).
